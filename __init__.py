@@ -105,16 +105,26 @@ def capture_current_output_settings(scene) -> dict:
             'audio_codec': getattr(ff, 'audio_codec', 'AAC'),
         }
 
-    # Summary string for quick UI display
-    summary = file_format
+    # Format badge for UI display: [Media Type] • [Codec / Format]
+    media_label = "Image"
+    if media_type == 'MULTI_LAYER_IMAGE' or file_format == 'OPEN_EXR_MULTILAYER':
+        media_label = "EXR Multi"
+    elif media_type == 'VIDEO' or file_format == 'FFMPEG':
+        media_label = "Video"
+
     if file_format == 'FFMPEG':
         ff = render.ffmpeg
-        summary = f"{getattr(ff, 'format', 'VIDEO')} / {getattr(ff, 'codec', 'H264')}"
+        container = getattr(ff, 'format', 'VIDEO').title()
+        codec = getattr(ff, 'codec', 'H264')
+        fmt_details = f"{container} / {codec}"
     elif 'OPEN_EXR' in file_format:
         codec = getattr(img, 'exr_codec', '')
-        summary = f"EXR ({codec})" if codec else "EXR"
+        fmt_details = f"EXR ({codec})" if codec else "EXR"
     else:
-        summary = f"{file_format} ({getattr(img, 'color_mode', '')})"
+        mode = getattr(img, 'color_mode', '')
+        fmt_details = f"{file_format} ({mode})" if mode else file_format
+
+    summary = f"{media_label} • {fmt_details}"
 
     return {
         'filepath': render.filepath,
@@ -353,34 +363,6 @@ class OUTPUT_MANAGER_OT_preset_apply(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class OUTPUT_MANAGER_OT_preset_update(bpy.types.Operator):
-    """Update selected preset with current scene output settings"""
-    bl_idname = "output_manager.preset_update"
-    bl_label = "Update Output Preset"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    name: bpy.props.StringProperty(name="Preset Name")
-
-    def execute(self, context):
-        data = load_presets_from_disk()
-        presets = data.get("presets", [])
-        target = next((p for p in presets if p["name"] == self.name), None)
-
-        if not target:
-            self.report({'WARNING'}, f"Preset '{self.name}' not found")
-            return {'CANCELLED'}
-
-        captured = capture_current_output_settings(context.scene)
-        target['filepath'] = captured['filepath']
-        target['format_summary'] = captured['format_summary']
-        target['format_settings'] = captured['format_settings']
-
-        data['active_preset'] = self.name
-        save_presets_to_disk(data)
-        self.report({'INFO'}, f"Updated output preset '{self.name}'")
-        return {'FINISHED'}
-
-
 class OUTPUT_MANAGER_OT_preset_remove(bpy.types.Operator):
     """Delete an output preset"""
     bl_idname = "output_manager.preset_remove"
@@ -414,7 +396,7 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.ui_units_x = 18
+        layout.ui_units_x = 21
 
         data = load_presets_from_disk()
         active_name = data.get("active_preset", "")
@@ -434,17 +416,17 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
             is_active = (p["name"] == active_name)
             box = col.box()
 
-            # Row 1: Apply All + Name + Format Tag + Delete
+            # Row 1: Active Tickmark + Name + Format/Media Tag + Delete
             r1 = box.row(align=True)
-            apply_all = r1.operator(
+            apply_all_icon = r1.operator(
                 "output_manager.preset_apply",
                 text="",
-                icon='CHECKMARK' if is_active else 'PLAY'
+                icon='CHECKMARK' if is_active else 'BLANK1'
             )
-            apply_all.name = p["name"]
-            apply_all.path_only = False
+            apply_all_icon.name = p["name"]
+            apply_all_icon.path_only = False
 
-            r1.label(text=p["name"], icon='FILE_FOLDER')
+            r1.label(text=p["name"])
 
             fmt_tag = p.get("format_summary", "")
             if fmt_tag:
@@ -453,18 +435,19 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
             del_op = r1.operator("output_manager.preset_remove", text="", icon='X')
             del_op.name = p["name"]
 
-            # Row 2: Filepath preview + Apply Path Only + Update Preset
+            # Row 2: Filepath preview + Apply All button + Path Only button
             r2 = box.row(align=True)
             raw_path = p.get("filepath", "")
             disp_path = raw_path[:22] + "..." if len(raw_path) > 22 else raw_path
             r2.label(text=disp_path if disp_path else "(empty)")
 
-            path_op = r2.operator("output_manager.preset_apply", text="Path", icon='FILE')
-            path_op.name = p["name"]
-            path_op.path_only = True
+            all_btn = r2.operator("output_manager.preset_apply", text="Apply All")
+            all_btn.name = p["name"]
+            all_btn.path_only = False
 
-            upd_op = r2.operator("output_manager.preset_update", text="", icon='FILE_REFRESH')
-            upd_op.name = p["name"]
+            path_btn = r2.operator("output_manager.preset_apply", text="Path")
+            path_btn.name = p["name"]
+            path_btn.path_only = True
 
 
 def draw_output_manager_header(self, context):
@@ -504,7 +487,6 @@ classes = (
     OUTPUT_MANAGER_OT_preset_add,
     OUTPUT_MANAGER_OT_confirm_overwrite,
     OUTPUT_MANAGER_OT_preset_apply,
-    OUTPUT_MANAGER_OT_preset_update,
     OUTPUT_MANAGER_OT_preset_remove,
     OUTPUT_MANAGER_PT_presets_popover,
 )
