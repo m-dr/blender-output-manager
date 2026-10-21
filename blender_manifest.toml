@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "output_manager"
+version = "0.1.0"
+name = "Output Manager (DEV)"
+tagline = "Global presets for render output filepath, file formats, and encoding settings"
+maintainer = "MD <m-dr>"
+type = "add-on"
+blender_version_min = "5.2.0"
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+tags = [
+  "Render",
+  "Pipeline",
+  "User Interface",
+]
+website = "https://github.com/m-dr/blender-output-manager"
