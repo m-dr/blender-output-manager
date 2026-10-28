@@ -73,6 +73,80 @@ def make_unique_name(existing_names: set, base_name: str) -> str:
 
 # --- Setting Capture & Restore ---
 
+def increment_path_version(filepath: str) -> tuple[str, bool]:
+    """Find version number occurrences across folder and filename, incrementing all in sync."""
+    if not filepath or not filepath.strip():
+        return filepath, False
+
+    # Regex matches isolated numbers, optionally prefixed with 'v' or 'V'
+    # Group 1: boundary/separator char (^ or non-alnum)
+    # Group 2: optional 'v' or 'V'
+    # Group 3: digits
+    pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])?(\d+)(?=[^a-zA-Z0-9]|$)')
+
+    matches = list(pattern.finditer(filepath))
+    if not matches:
+        return filepath, False
+
+    # Separate matches with explicit 'v' prefix from matches without
+    v_matches = [m for m in matches if m.group(2)]
+
+    if v_matches:
+        # If explicit 'v' tags exist, target version is based on the v-tags
+        max_val = max(int(m.group(3)) for m in v_matches)
+        target_digits_candidates = {m.group(3) for m in v_matches}
+
+        # Replace all v_matches, and any non-v matches sharing the same version digits
+        to_replace = []
+        for m in matches:
+            if m.group(2):
+                to_replace.append(m)
+            elif m.group(3) in target_digits_candidates:
+                to_replace.append(m)
+
+        next_val = max_val + 1
+        new_path = filepath
+        for m in reversed(to_replace):
+            orig_digits = m.group(3)
+            pad = len(orig_digits)
+            new_digits = f"{next_val:0{pad}d}"
+            start_idx = m.start(3)
+            end_idx = m.end(3)
+            new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+        return new_path, True
+
+    # No 'v' tags found. Find candidate version number from filename first
+    last_slash = max(filepath.rfind('/'), filepath.rfind('\\'))
+    file_part = filepath[last_slash + 1:] if last_slash != -1 else filepath
+
+    # Exclude trailing extension and frame tokens (#)
+    file_base = file_part
+    file_base = re.sub(r'#+$', '', file_base)
+    file_base = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', file_base)
+
+    file_matches = list(pattern.finditer(file_base))
+    if file_matches:
+        target_digits = file_matches[-1].group(3)
+    else:
+        target_digits = matches[-1].group(3)
+
+    target_val = int(target_digits)
+    next_val = target_val + 1
+    pad = len(target_digits)
+
+    # Replace all matches that have this exact digits string
+    to_replace = [m for m in matches if m.group(3) == target_digits]
+
+    new_path = filepath
+    for m in reversed(to_replace):
+        new_digits = f"{next_val:0{pad}d}"
+        start_idx = m.start(3)
+        end_idx = m.end(3)
+        new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+
+    return new_path, True
+
+
 def capture_current_output_settings(scene) -> dict:
     """Capture current filepath and format settings from scene."""
     render = scene.render
@@ -133,16 +207,13 @@ def capture_current_output_settings(scene) -> dict:
     }
 
 
-def apply_output_settings(scene, preset_dict: dict, path_only: bool = False) -> None:
-    """Apply preset settings to scene."""
+def apply_output_settings(scene, preset_dict: dict) -> None:
+    """Apply preset output settings and filepath to scene."""
     render = scene.render
 
-    # Always apply filepath
+    # Apply filepath
     if 'filepath' in preset_dict:
         render.filepath = preset_dict['filepath']
-
-    if path_only:
-        return
 
     # Apply format settings
     fmt = preset_dict.get('format_settings', {})
@@ -343,7 +414,6 @@ class OUTPUT_MANAGER_OT_preset_apply(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     name: bpy.props.StringProperty(name="Preset Name")
-    path_only: bpy.props.BoolProperty(name="Path Only", default=False)
 
     def execute(self, context):
         data = load_presets_from_disk()
@@ -354,12 +424,11 @@ class OUTPUT_MANAGER_OT_preset_apply(bpy.types.Operator):
             self.report({'WARNING'}, f"Preset '{self.name}' not found")
             return {'CANCELLED'}
 
-        apply_output_settings(context.scene, target, path_only=self.path_only)
+        apply_output_settings(context.scene, target)
         data['active_preset'] = self.name
         save_presets_to_disk(data)
 
-        mode_str = " (Path Only)" if self.path_only else " (All Settings)"
-        self.report({'INFO'}, f"Applied output preset '{self.name}'{mode_str}")
+        self.report({'INFO'}, f"Applied output preset '{self.name}'")
         return {'FINISHED'}
 
 
@@ -381,6 +450,24 @@ class OUTPUT_MANAGER_OT_preset_remove(bpy.types.Operator):
 
         save_presets_to_disk(data)
         self.report({'INFO'}, f"Removed output preset '{self.name}'")
+        return {'FINISHED'}
+
+
+class OUTPUT_MANAGER_OT_increment_version(bpy.types.Operator):
+    """Increment version number across all instances in the output filepath"""
+    bl_idname = "output_manager.increment_version"
+    bl_label = "Increment Version (+1)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        current_path = context.scene.render.filepath
+        new_path, ok = increment_path_version(current_path)
+        if not ok:
+            self.report({'WARNING'}, "No version number found to increment in output path")
+            return {'CANCELLED'}
+
+        context.scene.render.filepath = new_path
+        self.report({'INFO'}, f"Incremented output path: {new_path}")
         return {'FINISHED'}
 
 
@@ -418,13 +505,12 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
 
             # Row 1: Active Tickmark + Name + Format/Media Tag + Delete
             r1 = box.row(align=True)
-            apply_all_icon = r1.operator(
+            apply_icon = r1.operator(
                 "output_manager.preset_apply",
                 text="",
                 icon='CHECKMARK' if is_active else 'BLANK1'
             )
-            apply_all_icon.name = p["name"]
-            apply_all_icon.path_only = False
+            apply_icon.name = p["name"]
 
             r1.label(text=p["name"])
 
@@ -435,19 +521,14 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
             del_op = r1.operator("output_manager.preset_remove", text="", icon='X')
             del_op.name = p["name"]
 
-            # Row 2: Filepath preview + Apply All button + Path Only button
+            # Row 2: Filepath preview + single Apply button
             r2 = box.row(align=True)
             raw_path = p.get("filepath", "")
-            disp_path = raw_path[:22] + "..." if len(raw_path) > 22 else raw_path
+            disp_path = raw_path[:24] + "..." if len(raw_path) > 24 else raw_path
             r2.label(text=disp_path if disp_path else "(empty)")
 
-            all_btn = r2.operator("output_manager.preset_apply", text="Apply All")
-            all_btn.name = p["name"]
-            all_btn.path_only = False
-
-            path_btn = r2.operator("output_manager.preset_apply", text="Path")
-            path_btn.name = p["name"]
-            path_btn.path_only = True
+            apply_btn = r2.operator("output_manager.preset_apply", text="Apply")
+            apply_btn.name = p["name"]
 
 
 def draw_output_manager_header(self, context):
@@ -478,7 +559,8 @@ def draw_output_manager_header(self, context):
         text=disp_label,
         icon='PRESET',
     )
-    add_op = row.operator("output_manager.preset_add", text="", icon='ADD')
+    row.operator("output_manager.preset_add", text="", icon='ADD')
+    row.operator("output_manager.increment_version", text="+1")
 
 
 # --- Registration ---
@@ -488,6 +570,7 @@ classes = (
     OUTPUT_MANAGER_OT_confirm_overwrite,
     OUTPUT_MANAGER_OT_preset_apply,
     OUTPUT_MANAGER_OT_preset_remove,
+    OUTPUT_MANAGER_OT_increment_version,
     OUTPUT_MANAGER_PT_presets_popover,
 )
 
