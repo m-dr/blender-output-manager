@@ -130,12 +130,12 @@ def extract_version_info(filepath: str) -> dict:
     Defaults to version 1 with 'v' prefix ('v001') if no version number is found.
     """
     if not filepath or not filepath.strip():
-        return {'val': 1, 'pad': 3, 'has_v': True, 'prefix_char': 'v'}
+        return {'val': 1, 'pad': 3, 'has_v': False, 'prefix_char': 'v'}
 
     pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])?(\d+)(?=[^a-zA-Z0-9]|$)')
     matches = list(pattern.finditer(filepath))
     if not matches:
-        return {'val': 1, 'pad': 3, 'has_v': True, 'prefix_char': 'v'}
+        return {'val': 1, 'pad': 3, 'has_v': False, 'prefix_char': 'v'}
 
     v_matches = [m for m in matches if m.group(2)]
     if v_matches:
@@ -163,20 +163,142 @@ def extract_version_info(filepath: str) -> dict:
             'prefix_char': target.group(2) or ''
         }
 
-    return {'val': 1, 'pad': 3, 'has_v': True, 'prefix_char': 'v'}
+    return {'val': 1, 'pad': 3, 'has_v': False, 'prefix_char': 'v'}
 
 
-def adapt_preset_path(current_path: str, preset_path: str, target_file_format: str = '') -> str:
+def find_highest_version_on_disk(filepath: str) -> int:
+    """
+    Inspect disk to find the highest existing version number for a given filepath template.
+    Returns 0 if no matching versioned files or directories exist on disk.
+    """
+    if not filepath or not filepath.strip():
+        return 0
+
+    # Expand relative path if blend file is saved
+    if filepath.startswith('//'):
+        try:
+            if not bpy.data.is_saved:
+                return 0
+            abs_p = bpy.path.abspath(filepath)
+        except Exception:
+            return 0
+    else:
+        abs_p = filepath
+
+    # Expand basic scene/blend tokens for disk checking if present
+    try:
+        scene = getattr(bpy.context, 'scene', None) or (bpy.data.scenes[0] if bpy.data.scenes else None)
+        if scene and '{scene_name}' in abs_p:
+            abs_p = abs_p.replace('{scene_name}', scene.name)
+        if bpy.data.is_saved and '{blend}' in abs_p:
+            abs_p = abs_p.replace('{blend}', Path(bpy.data.filepath).stem)
+    except Exception:
+        pass
+
+    try:
+        clean_path = re.sub(r'#+$', '', abs_p.strip()).replace('\\', '/')
+    except Exception:
+        return 0
+
+    if clean_path.endswith('/'):
+        dir_part = clean_path[:-1]
+        file_part = ''
+    else:
+        last_slash = clean_path.rfind('/')
+        if last_slash != -1:
+            dir_part = clean_path[:last_slash]
+            file_part = clean_path[last_slash + 1:]
+        else:
+            dir_part = '.'
+            file_part = clean_path
+
+    versions_found = set()
+    v_pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])(\d+)(?=[^a-zA-Z0-9]|$)')
+
+    # 1. Scan directory segments for version tokens (e.g. /v002/beauty)
+    parts = dir_part.split('/')
+    for i, part in enumerate(parts):
+        m = v_pattern.search(part)
+        if m:
+            parent_dir = '/'.join(parts[:i]) if i > 0 else '.'
+            prefix = part[:m.start(2)]
+            if os.path.isdir(parent_dir):
+                try:
+                    for entry in os.scandir(parent_dir):
+                        if entry.is_dir():
+                            em = v_pattern.search(entry.name)
+                            if em and entry.name.startswith(prefix):
+                                versions_found.add(int(em.group(3)))
+                except Exception:
+                    pass
+
+    # 2. Scan file_part versions
+    if file_part:
+        base_no_ext = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', file_part)
+        fm = v_pattern.search(base_no_ext)
+        if fm:
+            file_prefix = base_no_ext[:fm.start(2)]
+            target_dirs = []
+            if os.path.isdir(dir_part):
+                target_dirs.append(dir_part)
+            for i, part in enumerate(parts):
+                m = v_pattern.search(part)
+                if m:
+                    parent_dir = '/'.join(parts[:i]) if i > 0 else '.'
+                    sub_path = '/'.join(parts[i+1:])
+                    if os.path.isdir(parent_dir):
+                        try:
+                            for entry in os.scandir(parent_dir):
+                                if entry.is_dir() and v_pattern.search(entry.name):
+                                    candidate = os.path.join(entry.path, sub_path).replace('\\', '/')
+                                    if os.path.isdir(candidate):
+                                        target_dirs.append(candidate)
+                        except Exception:
+                            pass
+
+            for d in set(target_dirs):
+                try:
+                    for entry in os.scandir(d):
+                        if entry.is_file():
+                            em = v_pattern.search(entry.name)
+                            if em and entry.name.startswith(file_prefix):
+                                versions_found.add(int(em.group(3)))
+                except Exception:
+                    pass
+
+    return max(versions_found) if versions_found else 0
+
+
+def adapt_preset_path(current_path: str, preset_path: str, target_file_format: str = '', check_disk: bool = True) -> str:
     """
     Intelligently adapt incoming preset path to keep current scene/node version,
-    defaulting to 1 if no version was present, and sanitizing image vs video extensions.
+    defaulting to 1 if no version was present or no prior versions exist on disk,
+    and sanitizing image vs video extensions.
     """
     if not preset_path or not preset_path.strip():
         return preset_path
 
     ver_info = extract_version_info(current_path)
-    val = ver_info['val']
+    current_ver = ver_info['val']
     pad = ver_info['pad']
+    has_explicit_ver = ver_info.get('has_v', False)
+
+    if check_disk:
+        highest_disk_preset = find_highest_version_on_disk(preset_path)
+        highest_disk_current = find_highest_version_on_disk(current_path) if current_path else 0
+        highest_disk_ver = max(highest_disk_preset, highest_disk_current)
+
+        if highest_disk_ver == 0:
+            val = 1
+        elif not has_explicit_ver:
+            val = highest_disk_ver + 1
+        else:
+            if current_ver > highest_disk_ver + 1:
+                val = highest_disk_ver + 1
+            else:
+                val = max(1, current_ver)
+    else:
+        val = current_ver
 
     pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])?(\d+)(?=[^a-zA-Z0-9]|$)')
     matches = list(pattern.finditer(preset_path))
@@ -192,14 +314,16 @@ def adapt_preset_path(current_path: str, preset_path: str, target_file_format: s
         new_path = preset_path
         for m in reversed(to_replace):
             pref = m.group(2) or ''
-            new_digits = f"{pref}{val:0{pad}d}" if pref else f"{val:0{pad}d}"
+            target_pad = max(pad, len(m.group(3)))
+            new_digits = f"{pref}{val:0{target_pad}d}" if pref else f"{val:0{target_pad}d}"
             start_idx = m.start(2) if m.group(2) else m.start(3)
             end_idx = m.end(3)
             new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
     elif matches:
         new_path = preset_path
         for m in reversed(matches):
-            new_digits = f"{val:0{pad}d}"
+            target_pad = max(pad, len(m.group(3)))
+            new_digits = f"{val:0{target_pad}d}"
             start_idx = m.start(3)
             end_idx = m.end(3)
             new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
@@ -420,7 +544,7 @@ def is_output_settings_dirty(scene, preset_dict: dict) -> bool:
     preset_raw = preset_dict.get('filepath', '')
     if preset_raw:
         target_fmt = fmt.get('file_format', '')
-        adapted = adapt_preset_path(scene.render.filepath, preset_raw, target_file_format=target_fmt)
+        adapted = adapt_preset_path(scene.render.filepath, preset_raw, target_file_format=target_fmt, check_disk=False)
         if scene.render.filepath != adapted:
             return True
 
