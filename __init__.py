@@ -124,6 +124,155 @@ def apply_format_settings_to_target(target_format, fmt: dict) -> None:
                 pass
 
 
+def extract_version_info(filepath: str) -> dict:
+    """
+    Extract active version number, padding, and prefix from a filepath.
+    Defaults to version 1 with 'v' prefix ('v001') if no version number is found.
+    """
+    if not filepath or not filepath.strip():
+        return {'val': 1, 'pad': 3, 'has_v': True, 'prefix_char': 'v'}
+
+    pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])?(\d+)(?=[^a-zA-Z0-9]|$)')
+    matches = list(pattern.finditer(filepath))
+    if not matches:
+        return {'val': 1, 'pad': 3, 'has_v': True, 'prefix_char': 'v'}
+
+    v_matches = [m for m in matches if m.group(2)]
+    if v_matches:
+        target = v_matches[-1]
+        return {
+            'val': int(target.group(3)),
+            'pad': len(target.group(3)),
+            'has_v': True,
+            'prefix_char': target.group(2)
+        }
+
+    # If no explicit 'v' found, search filename part
+    last_slash = max(filepath.rfind('/'), filepath.rfind('\\'))
+    file_part = filepath[last_slash + 1:] if last_slash != -1 else filepath
+    file_base = re.sub(r'#+$', '', file_part)
+    file_base = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', file_base)
+
+    file_matches = list(pattern.finditer(file_base))
+    if file_matches:
+        target = file_matches[-1]
+        return {
+            'val': int(target.group(3)),
+            'pad': len(target.group(3)),
+            'has_v': bool(target.group(2)),
+            'prefix_char': target.group(2) or ''
+        }
+
+    return {'val': 1, 'pad': 3, 'has_v': True, 'prefix_char': 'v'}
+
+
+def adapt_preset_path(current_path: str, preset_path: str, target_file_format: str = '') -> str:
+    """
+    Intelligently adapt incoming preset path to keep current scene/node version,
+    defaulting to 1 if no version was present, and sanitizing image vs video extensions.
+    """
+    if not preset_path or not preset_path.strip():
+        return preset_path
+
+    ver_info = extract_version_info(current_path)
+    val = ver_info['val']
+    pad = ver_info['pad']
+
+    pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])?(\d+)(?=[^a-zA-Z0-9]|$)')
+    matches = list(pattern.finditer(preset_path))
+    v_matches = [m for m in matches if m.group(2)]
+
+    if v_matches:
+        to_replace = []
+        target_digits_candidates = {m.group(3) for m in v_matches}
+        for m in matches:
+            if m.group(2) or m.group(3) in target_digits_candidates:
+                to_replace.append(m)
+
+        new_path = preset_path
+        for m in reversed(to_replace):
+            pref = m.group(2) or ''
+            new_digits = f"{pref}{val:0{pad}d}" if pref else f"{val:0{pad}d}"
+            start_idx = m.start(2) if m.group(2) else m.start(3)
+            end_idx = m.end(3)
+            new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+    elif matches:
+        new_path = preset_path
+        for m in reversed(matches):
+            new_digits = f"{val:0{pad}d}"
+            start_idx = m.start(3)
+            end_idx = m.end(3)
+            new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+    else:
+        new_path = preset_path
+
+    # Format-aware sanitization
+    if target_file_format == 'FFMPEG':
+        # Video: strip trailing frame tokens and image extensions
+        new_path = re.sub(r'#+$', '', new_path)
+        new_path = re.sub(r'\.(exr|png|jpg|jpeg|tga|tif|tiff|dpx|bmp|cin|hdr|webp)$', '', new_path, flags=re.IGNORECASE)
+        new_path = re.sub(r'#+$', '', new_path)
+        if new_path.endswith('_') and not new_path.endswith(('/_', '\\_')):
+            new_path = new_path[:-1]
+    elif target_file_format in ('OPEN_EXR', 'OPEN_EXR_MULTILAYER', 'PNG', 'TARGA', 'TIFF', 'JPEG', 'BMP', 'CINEON', 'DPX', 'HDR', 'WEBP'):
+        # Image sequence: strip video extensions
+        new_path = re.sub(r'\.(mp4|mov|mkv|avi|webm)$', '', new_path, flags=re.IGNORECASE)
+        # Ensure trailing frame separator if ends on alphanumeric
+        if not new_path.endswith(('/', '\\', '_', '.', '#')) and not re.search(r'\.[a-zA-Z0-9]{2,4}$', new_path):
+            new_path += '_'
+
+    return new_path
+
+
+def check_path_overwrite_status(filepath: str, file_format: str = '') -> bool:
+    """Check if rendered output file(s) already exist on disk for the given filepath."""
+    if not filepath or not filepath.strip():
+        return False
+    try:
+        abs_p = bpy.path.abspath(filepath)
+    except Exception:
+        return False
+
+    if file_format == 'FFMPEG':
+        clean = re.sub(r'#+$', '', abs_p)
+        if os.path.isfile(clean):
+            return True
+        base_no_ext = os.path.splitext(clean)[0]
+        for ext in ('.mp4', '.mov', '.mkv', '.avi', '.webm'):
+            if os.path.isfile(base_no_ext + ext):
+                return True
+        return False
+    else:
+        # Check if abs_p is a directory (typical in Compositor File Output nodes)
+        if abs_p.endswith(('/', '\\')):
+            if os.path.isdir(abs_p):
+                try:
+                    with os.scandir(abs_p) as it:
+                        for entry in it:
+                            if entry.is_file():
+                                return True
+                except Exception:
+                    pass
+            return False
+
+        d, prefix = os.path.split(abs_p)
+        prefix_clean = re.sub(r'#+$', '', prefix)
+        prefix_clean = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', prefix_clean)
+
+        if not os.path.isdir(d):
+            return False
+
+        if prefix_clean:
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        if entry.is_file() and entry.name.startswith(prefix_clean):
+                            return True
+            except Exception:
+                pass
+        return False
+
+
 def increment_path_version(filepath: str) -> tuple[str, bool]:
     """Find version number occurrences across folder and filename, incrementing all in sync."""
     if not filepath or not filepath.strip():
@@ -227,13 +376,15 @@ def capture_current_output_settings(scene) -> dict:
 
 
 def apply_output_settings(scene, preset_dict: dict) -> None:
-    """Apply preset output settings and filepath to scene render settings."""
+    """Apply preset output settings and filepath to scene render settings with intelligent version adaptation."""
     render = scene.render
+    fmt = preset_dict.get('format_settings', {})
 
     if 'filepath' in preset_dict:
-        render.filepath = preset_dict['filepath']
+        target_fmt = fmt.get('file_format', '')
+        adapted_path = adapt_preset_path(render.filepath, preset_dict['filepath'], target_file_format=target_fmt)
+        render.filepath = adapted_path
 
-    fmt = preset_dict.get('format_settings', {})
     if not fmt:
         return
 
@@ -254,20 +405,24 @@ def is_output_settings_dirty(scene, preset_dict: dict) -> bool:
     if not preset_dict:
         return False
 
-    if scene.render.filepath != preset_dict.get('filepath', ''):
-        return True
-
+    # Check format first
     fmt = preset_dict.get('format_settings', {})
-    if not fmt:
-        return False
+    if fmt:
+        img = scene.render.image_settings
+        if img.file_format != fmt.get('file_format'):
+            return True
+        if getattr(img, 'color_mode', None) != fmt.get('color_mode'):
+            return True
+        if getattr(img, 'color_depth', None) != fmt.get('color_depth'):
+            return True
 
-    img = scene.render.image_settings
-    if img.file_format != fmt.get('file_format'):
-        return True
-    if getattr(img, 'color_mode', None) != fmt.get('color_mode'):
-        return True
-    if getattr(img, 'color_depth', None) != fmt.get('color_depth'):
-        return True
+    # Compare adapted path rather than raw preset path
+    preset_raw = preset_dict.get('filepath', '')
+    if preset_raw:
+        target_fmt = fmt.get('file_format', '')
+        adapted = adapt_preset_path(scene.render.filepath, preset_raw, target_file_format=target_fmt)
+        if scene.render.filepath != adapted:
+            return True
 
     return False
 
@@ -334,7 +489,7 @@ def capture_file_output_node_settings(node) -> dict:
 
 def apply_preset_to_file_output_node(node, preset_dict: dict, mode: str = 'FORMAT') -> tuple[bool, str]:
     """
-    Apply preset to a File Output node.
+    Apply preset to a File Output node with intelligent version preservation.
     Modes:
       - 'FORMAT': apply image format/codec settings only.
       - 'FULL': apply both format settings and base directory.
@@ -353,20 +508,24 @@ def apply_preset_to_file_output_node(node, preset_dict: dict, mode: str = 'FORMA
     if mode in ('FORMAT', 'FULL') and fmt:
         apply_format_settings_to_target(node.format, fmt)
 
-    # 2. Apply Path
+    # 2. Apply Path with intelligent version preservation
     if mode in ('PATH', 'FULL'):
         preset_path = preset_dict.get('filepath', '')
         if preset_path:
-            if preset_path.endswith(('/', '\\')):
-                dir_part = preset_path
+            _, _, current_full = get_node_path_strings(node)
+            target_fmt = fmt.get('file_format', getattr(node.format, 'file_format', ''))
+            adapted = adapt_preset_path(current_full, preset_path, target_file_format=target_fmt)
+
+            if adapted.endswith(('/', '\\')):
+                dir_part = adapted
                 fn_part = ""
             else:
-                last_slash = max(preset_path.rfind('/'), preset_path.rfind('\\'))
+                last_slash = max(adapted.rfind('/'), adapted.rfind('\\'))
                 if last_slash != -1:
-                    dir_part = preset_path[:last_slash + 1]
-                    fn_part = preset_path[last_slash + 1:]
+                    dir_part = adapted[:last_slash + 1]
+                    fn_part = adapted[last_slash + 1:]
                 else:
-                    dir_part = preset_path + "/"
+                    dir_part = adapted + "/"
                     fn_part = ""
 
             set_node_path_strings(node, dir_part, fn_part)
@@ -805,6 +964,7 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.ui_units_x = 22
+        scene = context.scene
 
         data = load_presets_from_disk()
         active_name = data.get("active_preset", "")
@@ -812,6 +972,15 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
 
         col = layout.column(align=True)
         col.operator("output_manager.preset_add", text="Store Current Scene Output", icon='ADD')
+
+        # Option: Overwrite Warnings Toggle
+        row_opt = col.row(align=True)
+        row_opt.prop(
+            scene,
+            "output_manager_show_overwrite_warnings",
+            text="Warn on File Overwrite",
+            icon='ERROR' if scene.output_manager_show_overwrite_warnings else 'INFO'
+        )
 
         col.separator()
 
@@ -914,9 +1083,16 @@ class OUTPUT_MANAGER_PT_file_output_popover(bpy.types.Panel):
             store_btn = r1.operator("output_manager.file_output_store_preset", text="", icon='ADD')
             store_btn.node_name = node.name
 
-            # Row 2: Target Path Preview + Apply Buttons
+            # Row 2: Target Path Preview + Overwrite check + Apply Buttons
             r2 = node_box.row(align=True)
             _, _, full_path = get_node_path_strings(node)
+            is_node_overwrite = False
+            if scene.output_manager_show_overwrite_warnings:
+                is_node_overwrite = check_path_overwrite_status(full_path, getattr(node.format, 'file_format', ''))
+
+            if is_node_overwrite:
+                r2.label(text="", icon='ERROR')
+
             disp_path = full_path[:22] + "..." if len(full_path) > 22 else full_path
             r2.label(text=disp_path if disp_path else "(empty path)")
 
@@ -932,7 +1108,7 @@ class OUTPUT_MANAGER_PT_file_output_popover(bpy.types.Panel):
 
 
 def draw_output_manager_header(self, context):
-    """Draw Output Manager preset popover and File Output indicator in Output panel."""
+    """Draw Output Manager preset popover, File Output indicator, and overwrite warnings."""
     layout = self.layout
     scene = context.scene
 
@@ -963,7 +1139,16 @@ def draw_output_manager_header(self, context):
     row.operator("output_manager.preset_add", text="", icon='ADD')
     row.operator("output_manager.increment_version", text="+1")
 
-    # Row 2 (Option A): Notification & Popover for Compositor File Output Nodes
+    # Row 2: Overwrite Warning (Optional / Informative)
+    if getattr(scene, "output_manager_show_overwrite_warnings", True):
+        is_overwrite = check_path_overwrite_status(scene.render.filepath, getattr(scene.render.image_settings, 'file_format', ''))
+        if is_overwrite:
+            warn_box = layout.box()
+            w_row = warn_box.row(align=True)
+            w_row.alert = True
+            w_row.label(text="Existing render files found on disk (may be overwritten)", icon='ERROR')
+
+    # Row 3 (Option A): Notification & Popover for Compositor File Output Nodes
     fo_nodes = get_file_output_nodes(scene)
     if fo_nodes:
         active_count = sum(1 for n in fo_nodes if not n.mute)
@@ -1007,6 +1192,12 @@ def register():
         default=True
     )
 
+    bpy.types.Scene.output_manager_show_overwrite_warnings = bpy.props.BoolProperty(
+        name="Show Overwrite Warnings",
+        description="Check disk and display an informative warning in the UI if rendered files already exist for the current output path",
+        default=True
+    )
+
     if hasattr(bpy.types, "RENDER_PT_output"):
         bpy.types.RENDER_PT_output.prepend(draw_output_manager_header)
 
@@ -1021,6 +1212,12 @@ def unregister():
     if hasattr(bpy.types.Scene, "output_manager_sync_file_outputs"):
         try:
             del bpy.types.Scene.output_manager_sync_file_outputs
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.Scene, "output_manager_show_overwrite_warnings"):
+        try:
+            del bpy.types.Scene.output_manager_show_overwrite_warnings
         except Exception:
             pass
 
