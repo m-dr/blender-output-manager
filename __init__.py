@@ -24,17 +24,39 @@ def get_presets_filepath() -> Path:
     return base_dir / "presets.json"
 
 
+DEFAULT_SOCKET_PATTERNS = [
+    {"name": "VFX Subfolder (Standard)", "pattern": r"\{socket}\{socket}_####"},
+    {"name": "Flat Pass Sequence", "pattern": "{socket}_####"},
+    {"name": "Subfolder / Frame Token", "pattern": "{socket}/_####"},
+]
+
+
 def load_presets_from_disk() -> dict:
     """Load presets JSON dictionary from disk."""
     path = get_presets_filepath()
     if not path.exists():
-        return {"active_preset": "", "presets": []}
+        return {
+            "active_preset": "",
+            "presets": [],
+            "socket_patterns": list(DEFAULT_SOCKET_PATTERNS),
+            "active_socket_pattern": "VFX Subfolder (Standard)"
+        }
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if "socket_patterns" not in data or not data["socket_patterns"]:
+                data["socket_patterns"] = list(DEFAULT_SOCKET_PATTERNS)
+            if "active_socket_pattern" not in data:
+                data["active_socket_pattern"] = data["socket_patterns"][0]["name"]
+            return data
     except Exception as e:
         print(f"[Output Manager] Failed to load presets: {e}")
-        return {"active_preset": "", "presets": []}
+        return {
+            "active_preset": "",
+            "presets": [],
+            "socket_patterns": list(DEFAULT_SOCKET_PATTERNS),
+            "active_socket_pattern": "VFX Subfolder (Standard)"
+        }
 
 
 def save_presets_to_disk(data: dict) -> None:
@@ -723,6 +745,81 @@ def apply_preset_to_file_output_node(node, preset_dict: dict, mode: str = 'FORMA
     return True, "Success"
 
 
+# --- Compositor Socket Pattern Helpers ---
+
+def extract_socket_base_name(sock_input, slot_item) -> str:
+    """Extract clean pass/socket name from connected link or slot item string."""
+    if sock_input and hasattr(sock_input, 'is_linked') and sock_input.is_linked and sock_input.links:
+        from_sock = sock_input.links[0].from_socket
+        if from_sock and hasattr(from_sock, 'name') and from_sock.name:
+            return from_sock.name
+
+    raw = getattr(slot_item, 'name', '') or ''
+    if not raw:
+        return "Pass"
+
+    clean = re.sub(r'#+$', '', raw.strip())
+    clean = clean.rstrip('_.- ')
+    parts = [p for p in re.split(r'[\\/]', clean) if p]
+    return parts[-1] if parts else raw
+
+
+def abstract_pattern_from_slot(slot_name: str, base_name: str) -> str:
+    """Replace occurrences of base socket name in slot_name with {socket} token."""
+    if not base_name or not slot_name:
+        return slot_name
+    return slot_name.replace(base_name, "{socket}")
+
+
+def format_pass_sockets_on_node(node, pattern: str, clear_filename: bool = True) -> int:
+    """Format all pass slots on a Compositor File Output node according to pattern."""
+    if not node or getattr(node, 'type', None) != 'OUTPUT_FILE':
+        return 0
+
+    items = getattr(node, 'file_output_items', None) or getattr(node, 'file_slots', [])
+    if not items:
+        return 0
+
+    count = 0
+    for i, item in enumerate(items):
+        sock_input = node.inputs[i] if i < len(node.inputs) else None
+        base_name = extract_socket_base_name(sock_input, item)
+        if not base_name:
+            base_name = f"Pass{i+1}"
+
+        new_name = pattern.replace("{socket}", base_name).replace("{pass}", base_name)
+        item.name = new_name
+        count += 1
+
+    if clear_filename and ('\\' in pattern or '/' in pattern):
+        if hasattr(node, 'file_name'):
+            node.file_name = ""
+
+    return count
+
+
+def get_socket_pattern_enum_items(self, context):
+    """Dynamic EnumProperty callback returning all saved socket patterns."""
+    data = load_presets_from_disk()
+    patterns = data.get("socket_patterns", DEFAULT_SOCKET_PATTERNS)
+    items = []
+    for p in patterns:
+        name = p["name"]
+        pat = p.get("pattern", "")
+        items.append((name, name, pat))
+    return items if items else [("", "(No patterns)", "")]
+
+
+def update_socket_pattern_choice(self, context):
+    """Callback when user selects a different socket pattern preset."""
+    data = load_presets_from_disk()
+    patterns = data.get("socket_patterns", DEFAULT_SOCKET_PATTERNS)
+    choice = getattr(self, 'output_manager_socket_pattern_choice', '')
+    target = next((p for p in patterns if p["name"] == choice), None)
+    if target:
+        self.output_manager_custom_socket_pattern = target.get("pattern", r"\{socket}\{socket}_####")
+
+
 # --- Operators ---
 
 class OUTPUT_MANAGER_OT_preset_add(bpy.types.Operator):
@@ -1228,6 +1325,167 @@ class OUTPUT_MANAGER_OT_file_output_store_preset(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OUTPUT_MANAGER_OT_format_pass_sockets(bpy.types.Operator):
+    """Format and re-sync all pass slot paths on this File Output node using the active pattern template"""
+    bl_idname = "output_manager.format_pass_sockets"
+    bl_label = "Format Pass Sockets"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty(name="Node Name", default="")
+
+    def execute(self, context):
+        scene = context.scene
+        nodes = get_file_output_nodes(scene)
+        target_name = self.node_name or (context.active_node.name if context.active_node else "")
+        target_node = next((n for n in nodes if n.name == target_name), None)
+
+        if not target_node:
+            self.report({'WARNING'}, "Target File Output node not found")
+            return {'CANCELLED'}
+
+        switched_format = False
+        if getattr(target_node.format, 'file_format', '') == 'OPEN_EXR_MULTILAYER':
+            if hasattr(target_node.format, 'media_type'):
+                target_node.format.media_type = 'IMAGE'
+            target_node.format.file_format = 'OPEN_EXR'
+            switched_format = True
+
+        pattern = getattr(scene, 'output_manager_custom_socket_pattern', r"\{socket}\{socket}_####")
+        if not pattern.strip():
+            pattern = r"\{socket}\{socket}_####"
+
+        count = format_pass_sockets_on_node(target_node, pattern, clear_filename=True)
+        if count == 0:
+            self.report({'WARNING'}, f"Node '{target_node.name}' has no pass slots to format")
+            return {'CANCELLED'}
+
+        msg = f"Formatted {count} pass slot(s) on '{target_node.name}' using pattern '{pattern}'"
+        if switched_format:
+            msg += " (switched format from MultiLayer to OpenEXR)"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class OUTPUT_MANAGER_OT_capture_pattern_from_node(bpy.types.Operator):
+    """Detect the socket name in the active slot and abstract it into a reusable {socket} pattern template"""
+    bl_idname = "output_manager.capture_pattern_from_node"
+    bl_label = "Capture Pattern from Active Slot"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty(name="Node Name", default="")
+
+    def execute(self, context):
+        scene = context.scene
+        nodes = get_file_output_nodes(scene)
+        target_name = self.node_name or (context.active_node.name if context.active_node else "")
+        node = next((n for n in nodes if n.name == target_name), None)
+
+        if not node:
+            self.report({'WARNING'}, "Target File Output node not found")
+            return {'CANCELLED'}
+
+        items = getattr(node, 'file_output_items', None) or getattr(node, 'file_slots', [])
+        if not items:
+            self.report({'WARNING'}, f"Node '{node.name}' has no slots to capture from")
+            return {'CANCELLED'}
+
+        idx = getattr(node, 'active_item_index', 0)
+        if idx >= len(items):
+            idx = 0
+        target_item = items[idx]
+        sock_input = node.inputs[idx] if idx < len(node.inputs) else None
+
+        base_name = extract_socket_base_name(sock_input, target_item)
+        abstracted = abstract_pattern_from_slot(target_item.name, base_name)
+
+        if '{socket}' not in abstracted:
+            abstracted = r"\{socket}\{socket}_####"
+
+        scene.output_manager_custom_socket_pattern = abstracted
+        self.report({'INFO'}, f"Captured pattern template: '{abstracted}' from slot '{target_item.name}'")
+        return {'FINISHED'}
+
+
+class OUTPUT_MANAGER_OT_save_socket_pattern_preset(bpy.types.Operator):
+    """Save current socket pattern template as a named preset"""
+    bl_idname = "output_manager.save_socket_pattern_preset"
+    bl_label = "Save Socket Pattern Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: bpy.props.StringProperty(name="Preset Name", default="Pass Subfolder")
+    pattern: bpy.props.StringProperty(name="Pattern Template", default=r"\{socket}\{socket}_####")
+
+    def invoke(self, context, event):
+        scene = context.scene
+        self.pattern = getattr(scene, 'output_manager_custom_socket_pattern', r"\{socket}\{socket}_####")
+        data = load_presets_from_disk()
+        existing = {p["name"] for p in data.get("socket_patterns", [])}
+        self.name = make_unique_name(existing, "Pass Subfolder")
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.prop(self, "name")
+        col.prop(self, "pattern")
+        sample = self.pattern.replace("{socket}", "Depth").replace("{pass}", "Depth")
+        col.separator()
+        col.label(text=f"Sample: {sample}", icon='FORWARD')
+
+    def execute(self, context):
+        target_name = self.name.strip()
+        if not target_name:
+            target_name = "Pass Pattern"
+
+        data = load_presets_from_disk()
+        patterns = data.get("socket_patterns", list(DEFAULT_SOCKET_PATTERNS))
+
+        found = False
+        for p in patterns:
+            if p["name"] == target_name:
+                p["pattern"] = self.pattern
+                found = True
+                break
+        if not found:
+            patterns.append({"name": target_name, "pattern": self.pattern})
+
+        data["socket_patterns"] = patterns
+        data["active_socket_pattern"] = target_name
+        save_presets_to_disk(data)
+
+        context.scene.output_manager_socket_pattern_choice = target_name
+        context.scene.output_manager_custom_socket_pattern = self.pattern
+        self.report({'INFO'}, f"Saved socket pattern preset '{target_name}'")
+        return {'FINISHED'}
+
+
+class OUTPUT_MANAGER_OT_delete_socket_pattern_preset(bpy.types.Operator):
+    """Delete the active socket pattern preset"""
+    bl_idname = "output_manager.delete_socket_pattern_preset"
+    bl_label = "Delete Socket Pattern Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: bpy.props.StringProperty(name="Preset Name", default="")
+
+    def execute(self, context):
+        data = load_presets_from_disk()
+        patterns = data.get("socket_patterns", [])
+        target_name = self.name or context.scene.output_manager_socket_pattern_choice
+
+        if len(patterns) <= 1:
+            self.report({'WARNING'}, "Cannot delete the only remaining pattern preset")
+            return {'CANCELLED'}
+
+        data["socket_patterns"] = [p for p in patterns if p["name"] != target_name]
+        data["active_socket_pattern"] = data["socket_patterns"][0]["name"]
+        save_presets_to_disk(data)
+
+        context.scene.output_manager_socket_pattern_choice = data["active_socket_pattern"]
+        context.scene.output_manager_custom_socket_pattern = data["socket_patterns"][0].get("pattern", r"\{socket}\{socket}_####")
+        self.report({'INFO'}, f"Deleted socket pattern preset '{target_name}'")
+        return {'FINISHED'}
+
+
 # --- UI Panels & Controls ---
 
 class NODE_PT_output_manager_node(bpy.types.Panel):
@@ -1318,6 +1576,33 @@ class NODE_PT_output_manager_node(bpy.types.Panel):
                 w_row = box.row(align=True)
                 w_row.alert = True
                 w_row.label(text="Files exist on disk for this version (will overwrite)", icon='ERROR')
+
+        # Section: Pass Socket Formatter (Available for multi-file outputs)
+        if not is_multilayer:
+            box_fmt = layout.box()
+            h_row = box_fmt.row(align=True)
+            h_row.label(text="Pass Socket Formatter:", icon='NODE_COMPOSITING')
+            cap_op = h_row.operator("output_manager.capture_pattern_from_node", text="", icon='EYEDROPPER')
+            cap_op.node_name = node.name
+
+            # Pattern Dropdown + Save / Delete buttons
+            p_row = box_fmt.row(align=True)
+            p_row.prop(scene, "output_manager_socket_pattern_choice", text="")
+            save_p = p_row.operator("output_manager.save_socket_pattern_preset", text="", icon='ADD')
+            del_p = p_row.operator("output_manager.delete_socket_pattern_preset", text="", icon='X')
+
+            # Editable Template String
+            box_fmt.prop(scene, "output_manager_custom_socket_pattern", text="Template")
+
+            # Live Sample Preview
+            cur_pat = getattr(scene, 'output_manager_custom_socket_pattern', '') or r"\{socket}\{socket}_####"
+            sample_out = cur_pat.replace("{socket}", "Depth").replace("{pass}", "Depth")
+            box_fmt.label(text=f"Preview (Depth) -> {sample_out}", icon='FORWARD')
+
+            # Action Button
+            btn_row = box_fmt.row(align=True)
+            fmt_btn = btn_row.operator("output_manager.format_pass_sockets", text="⚡ Format Pass Sockets", icon='FILE_REFRESH')
+            fmt_btn.node_name = node.name
 
 
 class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
@@ -1472,6 +1757,10 @@ classes = (
     OUTPUT_MANAGER_OT_increment_version,
     OUTPUT_MANAGER_OT_file_output_apply_preset,
     OUTPUT_MANAGER_OT_file_output_store_preset,
+    OUTPUT_MANAGER_OT_format_pass_sockets,
+    OUTPUT_MANAGER_OT_capture_pattern_from_node,
+    OUTPUT_MANAGER_OT_save_socket_pattern_preset,
+    OUTPUT_MANAGER_OT_delete_socket_pattern_preset,
     OUTPUT_MANAGER_PT_presets_popover,
     NODE_PT_output_manager_node,
 )
@@ -1491,6 +1780,19 @@ def register():
         name="Show Overwrite Warnings",
         description="Check disk and display an informative warning in the UI if rendered files already exist for the current output path",
         default=True
+    )
+
+    bpy.types.Scene.output_manager_socket_pattern_choice = bpy.props.EnumProperty(
+        name="Socket Pattern",
+        description="Choose a saved pass socket naming pattern preset",
+        items=get_socket_pattern_enum_items,
+        update=update_socket_pattern_choice
+    )
+
+    bpy.types.Scene.output_manager_custom_socket_pattern = bpy.props.StringProperty(
+        name="Pattern Template",
+        description="Template string for pass sockets. Use {socket} for pass/socket name",
+        default=r"\{socket}\{socket}_####"
     )
 
     if hasattr(bpy.types, "RENDER_PT_output"):
@@ -1513,6 +1815,18 @@ def unregister():
     if hasattr(bpy.types.Scene, "output_manager_show_overwrite_warnings"):
         try:
             del bpy.types.Scene.output_manager_show_overwrite_warnings
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.Scene, "output_manager_socket_pattern_choice"):
+        try:
+            del bpy.types.Scene.output_manager_socket_pattern_choice
+        except Exception:
+            pass
+
+    if hasattr(bpy.types.Scene, "output_manager_custom_socket_pattern"):
+        try:
+            del bpy.types.Scene.output_manager_custom_socket_pattern
         except Exception:
             pass
 
