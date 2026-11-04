@@ -669,6 +669,17 @@ def set_node_path_strings(node, dir_str: str, file_name_str: str = ""):
         node.base_path = f"{dir_str}{file_name_str}" if file_name_str else dir_str
 
 
+def get_node_slots_collection(node):
+    """Retrieve the items/slots collection for a File Output node across Blender versions."""
+    if not node:
+        return []
+    for attr in ('file_output_items', 'layer_slots', 'file_slots'):
+        col = getattr(node, attr, None)
+        if col is not None:
+            return col
+    return []
+
+
 def capture_file_output_node_settings(node) -> dict:
     """Capture format and path settings from a File Output node as an Output Manager preset."""
     img = node.format
@@ -771,12 +782,29 @@ def abstract_pattern_from_slot(slot_name: str, base_name: str) -> str:
     return slot_name.replace(base_name, "{socket}")
 
 
+def clean_multilayer_channel_name(sock_input, slot_item) -> str:
+    """Extract clean channel/layer name from connected link or strip paths/tokens from item name."""
+    if sock_input and hasattr(sock_input, 'is_linked') and sock_input.is_linked and sock_input.links:
+        from_sock = sock_input.links[0].from_socket
+        if from_sock and hasattr(from_sock, 'name') and from_sock.name:
+            return from_sock.name
+
+    raw = getattr(slot_item, 'name', '') or ''
+    if not raw:
+        return "Render"
+
+    clean = re.sub(r'#+$', '', raw.strip())
+    clean = clean.rstrip('_.- ')
+    parts = [p for p in re.split(r'[\\/]', clean) if p]
+    return parts[-1] if parts else raw
+
+
 def format_pass_sockets_on_node(node, pattern: str, clear_filename: bool = True) -> int:
     """Format all pass slots on a Compositor File Output node according to pattern."""
     if not node or getattr(node, 'type', None) != 'OUTPUT_FILE':
         return 0
 
-    items = getattr(node, 'file_output_items', None) or getattr(node, 'file_slots', [])
+    items = get_node_slots_collection(node)
     if not items:
         return 0
 
@@ -1384,7 +1412,7 @@ class OUTPUT_MANAGER_OT_capture_pattern_from_node(bpy.types.Operator):
             self.report({'WARNING'}, "Target File Output node not found")
             return {'CANCELLED'}
 
-        items = getattr(node, 'file_output_items', None) or getattr(node, 'file_slots', [])
+        items = get_node_slots_collection(node)
         if not items:
             self.report({'WARNING'}, f"Node '{node.name}' has no slots to capture from")
             return {'CANCELLED'}
@@ -1486,6 +1514,43 @@ class OUTPUT_MANAGER_OT_delete_socket_pattern_preset(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OUTPUT_MANAGER_OT_clean_multilayer_slots(bpy.types.Operator):
+    """Reset layer names to clean channel names, removing leftover subfolders or frame tokens"""
+    bl_idname = "output_manager.clean_multilayer_slots"
+    bl_label = "Clean Layer Names"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty(name="Node Name", default="")
+
+    def execute(self, context):
+        scene = context.scene
+        nodes = get_file_output_nodes(scene)
+        target_name = self.node_name or (context.active_node.name if getattr(context, 'active_node', None) else "")
+        node = next((n for n in nodes if n.name == target_name), None)
+        if not node and getattr(context, 'active_node', None) and getattr(context.active_node, 'type', None) == 'OUTPUT_FILE':
+            node = context.active_node
+
+        if not node:
+            self.report({'WARNING'}, "Target File Output node not found")
+            return {'CANCELLED'}
+
+        items = get_node_slots_collection(node)
+        if not items:
+            self.report({'WARNING'}, f"Node '{node.name}' has no slots to clean")
+            return {'CANCELLED'}
+
+        count = 0
+        for i, item in enumerate(items):
+            sock_input = node.inputs[i] if i < len(node.inputs) else None
+            clean_name = clean_multilayer_channel_name(sock_input, item)
+            if item.name != clean_name:
+                item.name = clean_name
+                count += 1
+
+        self.report({'INFO'}, f"Cleaned {count} layer name(s) on '{node.name}'")
+        return {'FINISHED'}
+
+
 # --- UI Panels & Controls ---
 
 class NODE_PT_output_manager_node(bpy.types.Panel):
@@ -1532,7 +1597,7 @@ class NODE_PT_output_manager_node(bpy.types.Panel):
 
         dir_str = getattr(node, 'directory', '') or getattr(node, 'base_path', '')
         fn_str = getattr(node, 'file_name', '')
-        items = getattr(node, 'file_output_items', None) or getattr(node, 'layer_slots', None) or getattr(node, 'file_slots', [])
+        items = get_node_slots_collection(node)
 
         if is_multilayer:
             # MultiLayer OpenEXR: Single unified file
@@ -1548,6 +1613,9 @@ class NODE_PT_output_manager_node(bpy.types.Panel):
                 box.label(text=f"Layers: {', '.join(layer_names)}{more}")
             else:
                 box.label(text="Layers: (no passes connected)", icon='INFO')
+
+            clean_btn = box.operator("output_manager.clean_multilayer_slots", text="⚡ Clean Layer Names", icon='FILE_REFRESH')
+            clean_btn.node_name = node.name
         else:
             # Multi-File Output (PNG, TIFF, OpenEXR single, etc.)
             b_hdr = box.row(align=True)
@@ -1568,14 +1636,6 @@ class NODE_PT_output_manager_node(bpy.types.Panel):
 
             box.label(text="Rule: <Directory> + <File Name> + <Pass Name>")
             box.label(text=f"Example: {example_fn}")
-
-        # Overwrite warning if applicable
-        if getattr(scene, "output_manager_show_overwrite_warnings", True):
-            _, _, full_p = get_node_path_strings(node)
-            if check_path_overwrite_status(full_p, getattr(node.format, 'file_format', '')):
-                w_row = box.row(align=True)
-                w_row.alert = True
-                w_row.label(text="Files exist on disk for this version (will overwrite)", icon='ERROR')
 
         # Section: Pass Socket Formatter (Available for multi-file outputs)
         if not is_multilayer:
@@ -1624,16 +1684,6 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
 
         col = layout.column(align=True)
         col.operator("output_manager.preset_add", text="Store Current Scene Output", icon='ADD')
-
-        # Option: Overwrite Warnings Toggle
-        row_opt = col.row(align=True)
-        row_opt.prop(
-            scene,
-            "output_manager_show_overwrite_warnings",
-            text="Warn on File Overwrite",
-            icon='ERROR' if scene.output_manager_show_overwrite_warnings else 'INFO'
-        )
-
         col.separator()
 
         if not presets:
@@ -1711,16 +1761,7 @@ def draw_output_manager_header(self, context):
     comp_row.prop(scene.render, "use_compositing", text="Compositor", icon='NODE_COMPOSITING')
     comp_row.prop(scene, "output_manager_sync_file_outputs", text="Sync Comp (+1/-1)", icon='LINKED')
 
-    # Row 3: Overwrite Warning (Optional / Informative)
-    if getattr(scene, "output_manager_show_overwrite_warnings", True):
-        is_overwrite = check_path_overwrite_status(scene.render.filepath, getattr(scene.render.image_settings, 'file_format', ''))
-        if is_overwrite:
-            warn_box = layout.box()
-            w_row = warn_box.row(align=True)
-            w_row.alert = True
-            w_row.label(text="Existing render files found on disk (may be overwritten)", icon='ERROR')
-
-    # Row 4: Detected Compositor File Output Nodes directly inline
+    # Row 3: Detected Compositor File Output Nodes directly inline
     fo_nodes = get_file_output_nodes(scene)
     if fo_nodes:
         box = layout.box()
@@ -1736,12 +1777,6 @@ def draw_output_manager_header(self, context):
             nrow.label(text=format_summary_from_rna(node.format))
 
             _, _, full_p = get_node_path_strings(node)
-            is_node_overwrite = False
-            if getattr(scene, "output_manager_show_overwrite_warnings", True):
-                is_node_overwrite = check_path_overwrite_status(full_p, getattr(node.format, 'file_format', ''))
-            if is_node_overwrite:
-                nrow.label(text="", icon='ERROR')
-
             disp_p = full_p[:20] + "..." if len(full_p) > 20 else full_p
             nrow.label(text=disp_p if disp_p else "(empty)")
 
@@ -1758,6 +1793,7 @@ classes = (
     OUTPUT_MANAGER_OT_file_output_apply_preset,
     OUTPUT_MANAGER_OT_file_output_store_preset,
     OUTPUT_MANAGER_OT_format_pass_sockets,
+    OUTPUT_MANAGER_OT_clean_multilayer_slots,
     OUTPUT_MANAGER_OT_capture_pattern_from_node,
     OUTPUT_MANAGER_OT_save_socket_pattern_preset,
     OUTPUT_MANAGER_OT_delete_socket_pattern_preset,
@@ -1773,12 +1809,6 @@ def register():
     bpy.types.Scene.output_manager_sync_file_outputs = bpy.props.BoolProperty(
         name="Sync Comp (+1/-1)",
         description="When stepping output path version with +1 or -1, also step version numbers across all active Compositor File Output nodes",
-        default=True
-    )
-
-    bpy.types.Scene.output_manager_show_overwrite_warnings = bpy.props.BoolProperty(
-        name="Show Overwrite Warnings",
-        description="Check disk and display an informative warning in the UI if rendered files already exist for the current output path",
         default=True
     )
 
@@ -1809,12 +1839,6 @@ def unregister():
     if hasattr(bpy.types.Scene, "output_manager_sync_file_outputs"):
         try:
             del bpy.types.Scene.output_manager_sync_file_outputs
-        except Exception:
-            pass
-
-    if hasattr(bpy.types.Scene, "output_manager_show_overwrite_warnings"):
-        try:
-            del bpy.types.Scene.output_manager_show_overwrite_warnings
         except Exception:
             pass
 
