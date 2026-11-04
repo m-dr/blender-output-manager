@@ -458,6 +458,72 @@ def increment_path_version(filepath: str) -> tuple[str, bool]:
     return new_path, True
 
 
+def decrement_path_version(filepath: str) -> tuple[str, bool]:
+    """Find version number occurrences across folder and filename, decrementing all in sync (floor at 1)."""
+    if not filepath or not filepath.strip():
+        return filepath, False
+
+    pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])?(\d+)(?=[^a-zA-Z0-9]|$)')
+    matches = list(pattern.finditer(filepath))
+    if not matches:
+        return filepath, False
+
+    v_matches = [m for m in matches if m.group(2)]
+    if v_matches:
+        max_val = max(int(m.group(3)) for m in v_matches)
+        if max_val <= 1:
+            return filepath, False  # Floor at 1
+
+        target_digits_candidates = {m.group(3) for m in v_matches}
+        to_replace = []
+        for m in matches:
+            if m.group(2):
+                to_replace.append(m)
+            elif m.group(3) in target_digits_candidates:
+                to_replace.append(m)
+
+        next_val = max(1, max_val - 1)
+        new_path = filepath
+        for m in reversed(to_replace):
+            orig_digits = m.group(3)
+            pad = len(orig_digits)
+            new_digits = f"{next_val:0{pad}d}"
+            start_idx = m.start(3)
+            end_idx = m.end(3)
+            new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+        return new_path, True
+
+    last_slash = max(filepath.rfind('/'), filepath.rfind('\\'))
+    file_part = filepath[last_slash + 1:] if last_slash != -1 else filepath
+
+    file_base = file_part
+    file_base = re.sub(r'#+$', '', file_base)
+    file_base = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', file_base)
+
+    file_matches = list(pattern.finditer(file_base))
+    if file_matches:
+        target_digits = file_matches[-1].group(3)
+    else:
+        target_digits = matches[-1].group(3)
+
+    target_val = int(target_digits)
+    if target_val <= 1:
+        return filepath, False  # Floor at 1
+
+    next_val = max(1, target_val - 1)
+    pad = len(target_digits)
+
+    to_replace = [m for m in matches if m.group(3) == target_digits]
+    new_path = filepath
+    for m in reversed(to_replace):
+        new_digits = f"{next_val:0{pad}d}"
+        start_idx = m.start(3)
+        end_idx = m.end(3)
+        new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+
+    return new_path, True
+
+
 def capture_current_output_settings(scene) -> dict:
     """Capture current filepath and format settings from scene render settings."""
     render = scene.render
@@ -830,14 +896,143 @@ class OUTPUT_MANAGER_OT_preset_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OUTPUT_MANAGER_OT_decrement_version(bpy.types.Operator):
+    """Decrement version number across all instances in the output filepath and active Compositor File Output nodes (floor at 1)"""
+    bl_idname = "output_manager.decrement_version"
+    bl_label = "Decrement Version (-1)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty(name="Node Name", default="")
+
+    def execute(self, context):
+        scene = context.scene
+
+        # Target a specific node if requested (e.g. from Node Tab in Compositor)
+        if self.node_name:
+            nodes = get_file_output_nodes(scene)
+            target_node = next((n for n in nodes if n.name == self.node_name), None)
+            if not target_node:
+                self.report({'WARNING'}, f"Node '{self.node_name}' not found")
+                return {'CANCELLED'}
+
+            changed = False
+            if hasattr(target_node, "directory") and target_node.directory:
+                new_dir, ok_dir = decrement_path_version(target_node.directory)
+                if ok_dir:
+                    target_node.directory = new_dir
+                    changed = True
+            elif hasattr(target_node, "base_path") and target_node.base_path:
+                new_bp, ok_bp = decrement_path_version(target_node.base_path)
+                if ok_bp:
+                    target_node.base_path = new_bp
+                    changed = True
+
+            if hasattr(target_node, "file_name") and target_node.file_name:
+                new_fn, ok_fn = decrement_path_version(target_node.file_name)
+                if ok_fn:
+                    target_node.file_name = new_fn
+                    changed = True
+
+            if not changed:
+                self.report({'WARNING'}, f"Cannot decrement: Node '{self.node_name}' has no version number or is already at v001")
+                return {'CANCELLED'}
+
+            _, _, full_p = get_node_path_strings(target_node)
+            self.report({'INFO'}, f"Decremented (-1): Node '{self.node_name}' -> {full_p}")
+            return {'FINISHED'}
+
+        # Global decrement (main path + synced active File Output nodes)
+        current_path = scene.render.filepath
+        new_path, ok_main = decrement_path_version(current_path)
+        if ok_main:
+            scene.render.filepath = new_path
+
+        fo_updated = 0
+        if getattr(scene, "output_manager_sync_file_outputs", True):
+            for node in get_file_output_nodes(scene):
+                if node.mute:
+                    continue
+                node_changed = False
+                if hasattr(node, "directory") and node.directory:
+                    new_dir, ok_dir = decrement_path_version(node.directory)
+                    if ok_dir:
+                        node.directory = new_dir
+                        node_changed = True
+                elif hasattr(node, "base_path") and node.base_path:
+                    new_bp, ok_bp = decrement_path_version(node.base_path)
+                    if ok_bp:
+                        node.base_path = new_bp
+                        node_changed = True
+
+                if hasattr(node, "file_name") and node.file_name:
+                    new_fn, ok_fn = decrement_path_version(node.file_name)
+                    if ok_fn:
+                        node.file_name = new_fn
+                        node_changed = True
+
+                if node_changed:
+                    fo_updated += 1
+
+        if not ok_main and fo_updated == 0:
+            self.report({'WARNING'}, "Cannot decrement: No version number found or already at version 1")
+            return {'CANCELLED'}
+
+        msg_parts = []
+        if ok_main:
+            msg_parts.append(f"Main path -> {new_path}")
+        if fo_updated > 0:
+            msg_parts.append(f"{fo_updated} File Output node(s)")
+
+        self.report({'INFO'}, f"Decremented (-1): {', '.join(msg_parts)}")
+        return {'FINISHED'}
+
+
 class OUTPUT_MANAGER_OT_increment_version(bpy.types.Operator):
     """Increment version number across all instances in the output filepath and active Compositor File Output nodes"""
     bl_idname = "output_manager.increment_version"
     bl_label = "Increment Version (+1)"
     bl_options = {'REGISTER', 'UNDO'}
 
+    node_name: bpy.props.StringProperty(name="Node Name", default="")
+
     def execute(self, context):
         scene = context.scene
+
+        # Target a specific node if requested (e.g. from Node Tab in Compositor)
+        if self.node_name:
+            nodes = get_file_output_nodes(scene)
+            target_node = next((n for n in nodes if n.name == self.node_name), None)
+            if not target_node:
+                self.report({'WARNING'}, f"Node '{self.node_name}' not found")
+                return {'CANCELLED'}
+
+            changed = False
+            if hasattr(target_node, "directory") and target_node.directory:
+                new_dir, ok_dir = increment_path_version(target_node.directory)
+                if ok_dir:
+                    target_node.directory = new_dir
+                    changed = True
+            elif hasattr(target_node, "base_path") and target_node.base_path:
+                new_bp, ok_bp = increment_path_version(target_node.base_path)
+                if ok_bp:
+                    target_node.base_path = new_bp
+                    changed = True
+
+            if hasattr(target_node, "file_name") and target_node.file_name:
+                new_fn, ok_fn = increment_path_version(target_node.file_name)
+                if ok_fn:
+                    target_node.file_name = new_fn
+                    changed = True
+
+            if not changed:
+                self.report({'WARNING'}, f"No version number found in node '{self.node_name}'")
+                return {'CANCELLED'}
+
+            _, _, full_p = get_node_path_strings(target_node)
+            self.report({'INFO'}, f"Incremented (+1): Node '{self.node_name}' -> {full_p}")
+            return {'FINISHED'}
+
+        # Global increment (main path + synced active File Output nodes)
         current_path = scene.render.filepath
         new_path, ok_main = increment_path_version(current_path)
         if ok_main:
@@ -968,48 +1163,6 @@ class OUTPUT_MANAGER_OT_file_output_apply_preset(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class OUTPUT_MANAGER_OT_file_output_apply_preset_all(bpy.types.Operator):
-    """Apply an Output Manager preset to all active Compositor File Output nodes"""
-    bl_idname = "output_manager.file_output_apply_preset_all"
-    bl_label = "Apply Preset to All File Output Nodes"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    preset_name: bpy.props.StringProperty(name="Preset Name")
-    mode: bpy.props.EnumProperty(
-        name="Apply Mode",
-        items=[
-            ('FORMAT', "Format Only", "Update node file format, compression, and bit depth only"),
-            ('FULL', "Path & Format", "Update both format settings and base directory"),
-            ('PATH', "Path Only", "Update directory path only"),
-        ],
-        default='FORMAT'
-    )
-
-    def execute(self, context):
-        data = load_presets_from_disk()
-        presets = data.get("presets", [])
-        preset = next((p for p in presets if p["name"] == self.preset_name), None)
-
-        if not preset:
-            self.report({'WARNING'}, f"Preset '{self.preset_name}' not found")
-            return {'CANCELLED'}
-
-        nodes = get_file_output_nodes(context.scene)
-        active_nodes = [n for n in nodes if not n.mute]
-        if not active_nodes:
-            self.report({'INFO'}, "No active File Output nodes found")
-            return {'CANCELLED'}
-
-        applied_count = 0
-        for node in active_nodes:
-            ok, _ = apply_preset_to_file_output_node(node, preset, mode=self.mode)
-            if ok:
-                applied_count += 1
-
-        self.report({'INFO'}, f"Applied preset '{self.preset_name}' ({self.mode}) to {applied_count} File Output node(s)")
-        return {'FINISHED'}
-
-
 class OUTPUT_MANAGER_OT_file_output_store_preset(bpy.types.Operator):
     """Capture format and path settings from this File Output node into the global presets list"""
     bl_idname = "output_manager.file_output_store_preset"
@@ -1075,7 +1228,97 @@ class OUTPUT_MANAGER_OT_file_output_store_preset(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# --- UI Popover & Panel Integration ---
+# --- UI Panels & Controls ---
+
+class NODE_PT_output_manager_node(bpy.types.Panel):
+    """File Output Presets & Path Information in Compositor Node Tab"""
+    bl_label = "File Output Presets & Paths"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Node"
+    bl_order = 0
+
+    @classmethod
+    def poll(cls, context):
+        snode = getattr(context, 'space_data', None)
+        if not snode or getattr(snode, 'tree_type', None) != 'CompositorNodeTree':
+            return False
+        node = getattr(context, 'active_node', None)
+        return node and getattr(node, 'type', None) == 'OUTPUT_FILE'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        node = context.active_node
+        if not node:
+            return
+
+        # Row 1: Preset Actions + Version Stepping for this active node
+        row = layout.row(align=True)
+        apply_op = row.operator("output_manager.file_output_apply_preset", text="Apply Preset...", icon='PRESET')
+        apply_op.node_name = node.name
+
+        store_op = row.operator("output_manager.file_output_store_preset", text="", icon='ADD')
+        store_op.node_name = node.name
+
+        dec_op = row.operator("output_manager.decrement_version", text="-1")
+        dec_op.node_name = node.name
+
+        inc_op = row.operator("output_manager.increment_version", text="+1")
+        inc_op.node_name = node.name
+
+        # Box: Output Architecture Breakdown
+        box = layout.box()
+        file_format = getattr(node.format, 'file_format', 'OPEN_EXR')
+        is_multilayer = (file_format == 'OPEN_EXR_MULTILAYER')
+
+        dir_str = getattr(node, 'directory', '') or getattr(node, 'base_path', '')
+        fn_str = getattr(node, 'file_name', '')
+        items = getattr(node, 'file_output_items', None) or getattr(node, 'layer_slots', None) or getattr(node, 'file_slots', [])
+
+        if is_multilayer:
+            # MultiLayer OpenEXR: Single unified file
+            b_hdr = box.row(align=True)
+            b_hdr.label(text="MultiLayer EXR: Single File for All Layers", icon='FILE_IMAGE')
+
+            target_fn = f"{dir_str}{fn_str}####.exr" if fn_str else f"{dir_str}####.exr"
+            box.label(text=f"Target: {target_fn}")
+
+            if items:
+                layer_names = [it.name for it in items[:5]]
+                more = f" (+{len(items)-5} more)" if len(items) > 5 else ""
+                box.label(text=f"Layers: {', '.join(layer_names)}{more}")
+            else:
+                box.label(text="Layers: (no passes connected)", icon='INFO')
+        else:
+            # Multi-File Output (PNG, TIFF, OpenEXR single, etc.)
+            b_hdr = box.row(align=True)
+            b_hdr.label(text="Multi-File Output: Separate File Per Pass", icon='DOCUMENTS')
+
+            ext = 'exr'
+            if 'png' in file_format.lower():
+                ext = 'png'
+            elif 'jpeg' in file_format.lower() or 'jpg' in file_format.lower():
+                ext = 'jpg'
+            elif 'tiff' in file_format.lower():
+                ext = 'tif'
+            elif 'targa' in file_format.lower():
+                ext = 'tga'
+
+            first_item = items[0].name if items and len(items) > 0 else "<Pass>"
+            example_fn = f"{dir_str}{fn_str}{first_item}####.{ext}"
+
+            box.label(text="Rule: <Directory> + <File Name> + <Pass Name>")
+            box.label(text=f"Example: {example_fn}")
+
+        # Overwrite warning if applicable
+        if getattr(scene, "output_manager_show_overwrite_warnings", True):
+            _, _, full_p = get_node_path_strings(node)
+            if check_path_overwrite_status(full_p, getattr(node.format, 'file_format', '')):
+                w_row = box.row(align=True)
+                w_row.alert = True
+                w_row.label(text="Files exist on disk for this version (will overwrite)", icon='ERROR')
+
 
 class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
     """Global Output Presets Popover"""
@@ -1145,94 +1388,8 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
             apply_btn.name = p["name"]
 
 
-class OUTPUT_MANAGER_PT_file_output_popover(bpy.types.Panel):
-    """Compositor File Output Nodes & Presets Popover"""
-    bl_label = "Compositor File Outputs"
-    bl_space_type = 'PROPERTIES'
-    bl_region_type = 'WINDOW'
-    bl_context = "output"
-    bl_idname = "OUTPUT_MANAGER_PT_file_output_popover"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.ui_units_x = 25
-        scene = context.scene
-
-        fo_nodes = get_file_output_nodes(scene)
-        if not fo_nodes:
-            box = layout.box()
-            box.label(text="No File Output nodes in Compositor", icon='INFO')
-            return
-
-        data = load_presets_from_disk()
-        active_preset = data.get("active_preset", "")
-
-        col = layout.column(align=True)
-
-        # Global Versioning Toggle Box
-        top_box = col.box()
-        t_row = top_box.row(align=True)
-        t_row.prop(
-            scene,
-            "output_manager_sync_file_outputs",
-            text="Increment Versions with +1",
-            icon='CHECKBOX_HLT' if scene.output_manager_sync_file_outputs else 'CHECKBOX_DEHLT'
-        )
-
-        if active_preset:
-            t_row2 = top_box.row(align=True)
-            apply_all_op = t_row2.operator(
-                "output_manager.file_output_apply_preset_all",
-                text=f"Apply '{active_preset}' (Format) to All",
-                icon='FILE_REFRESH'
-            )
-            apply_all_op.preset_name = active_preset
-            apply_all_op.mode = 'FORMAT'
-
-        col.separator()
-        col.label(text="Detected File Output Nodes:", icon='NODE_COMPOSITING')
-
-        for node in fo_nodes:
-            node_box = col.box()
-
-            # Row 1: Mute status + Node Name + Format Tag + Store Preset
-            r1 = node_box.row(align=True)
-            mute_icon = 'CHECKMARK' if not node.mute else 'RESTRICT_VIEW_ON'
-            r1.prop(node, "mute", text="", icon=mute_icon, invert_checkbox=True)
-            r1.label(text=node.name, icon='OUTPUT')
-
-            fmt_summary = format_summary_from_rna(node.format)
-            r1.label(text=fmt_summary)
-
-            store_btn = r1.operator("output_manager.file_output_store_preset", text="", icon='ADD')
-            store_btn.node_name = node.name
-
-            # Row 2: Target Path Preview + Overwrite check + Apply Buttons
-            r2 = node_box.row(align=True)
-            _, _, full_path = get_node_path_strings(node)
-            is_node_overwrite = False
-            if scene.output_manager_show_overwrite_warnings:
-                is_node_overwrite = check_path_overwrite_status(full_path, getattr(node.format, 'file_format', ''))
-
-            if is_node_overwrite:
-                r2.label(text="", icon='ERROR')
-
-            disp_path = full_path[:22] + "..." if len(full_path) > 22 else full_path
-            r2.label(text=disp_path if disp_path else "(empty path)")
-
-            if active_preset:
-                q_apply = r2.operator("output_manager.file_output_apply_preset", text="Apply Active")
-                q_apply.node_name = node.name
-                q_apply.preset_name = active_preset
-                q_apply.mode = 'FORMAT'
-
-            custom_apply = r2.operator("output_manager.file_output_apply_preset", text="", icon='DOWNARROW_HLT')
-            custom_apply.node_name = node.name
-            custom_apply.preset_name = ""
-
-
 def draw_output_manager_header(self, context):
-    """Draw Output Manager preset popover, File Output indicator, and overwrite warnings."""
+    """Draw Output Manager preset popover, compositor toggles, and inline File Output nodes."""
     layout = self.layout
     scene = context.scene
 
@@ -1245,7 +1402,7 @@ def draw_output_manager_header(self, context):
     if active_preset:
         is_dirty = is_output_settings_dirty(scene, active_preset)
 
-    # Row 1: Output Presets Popover + Store (+) + Increment (+1)
+    # Row 1: Output Presets Popover + Store (+) + Decrement (-1) + Increment (+1)
     row = layout.row(align=True)
     if active_name:
         prefix = "* " if is_dirty else ""
@@ -1261,9 +1418,15 @@ def draw_output_manager_header(self, context):
         icon='PRESET',
     )
     row.operator("output_manager.preset_add", text="", icon='ADD')
+    row.operator("output_manager.decrement_version", text="-1")
     row.operator("output_manager.increment_version", text="+1")
 
-    # Row 2: Overwrite Warning (Optional / Informative)
+    # Row 2: Compact 1-row control: 1) Enable/disable Compositor, 2) Toggle lockstep sync
+    comp_row = layout.row(align=True)
+    comp_row.prop(scene.render, "use_compositing", text="Compositor", icon='NODE_COMPOSITING')
+    comp_row.prop(scene, "output_manager_sync_file_outputs", text="Sync Comp (+1/-1)", icon='LINKED')
+
+    # Row 3: Overwrite Warning (Optional / Informative)
     if getattr(scene, "output_manager_show_overwrite_warnings", True):
         is_overwrite = check_path_overwrite_status(scene.render.filepath, getattr(scene.render.image_settings, 'file_format', ''))
         if is_overwrite:
@@ -1272,22 +1435,30 @@ def draw_output_manager_header(self, context):
             w_row.alert = True
             w_row.label(text="Existing render files found on disk (may be overwritten)", icon='ERROR')
 
-    # Row 3 (Option A): Notification & Popover for Compositor File Output Nodes
+    # Row 4: Detected Compositor File Output Nodes directly inline
     fo_nodes = get_file_output_nodes(scene)
     if fo_nodes:
+        box = layout.box()
         active_count = sum(1 for n in fo_nodes if not n.mute)
-        muted_count = len(fo_nodes) - active_count
-        if muted_count > 0:
-            fo_label = f"File Output: {active_count} active ({muted_count} muted)"
-        else:
-            fo_label = f"File Output: {active_count} active"
+        hdr = box.row(align=True)
+        hdr.label(text=f"Compositor File Outputs ({active_count} active):", icon='NODE_COMPOSITING')
 
-        sub_row = layout.row(align=True)
-        sub_row.popover(
-            panel="OUTPUT_MANAGER_PT_file_output_popover",
-            text=fo_label,
-            icon='NODE_COMPOSITING',
-        )
+        for node in fo_nodes:
+            nrow = box.row(align=True)
+            mute_icon = 'CHECKMARK' if not node.mute else 'RESTRICT_VIEW_ON'
+            nrow.prop(node, "mute", text="", icon=mute_icon, invert_checkbox=True)
+            nrow.label(text=node.name, icon='OUTPUT')
+            nrow.label(text=format_summary_from_rna(node.format))
+
+            _, _, full_p = get_node_path_strings(node)
+            is_node_overwrite = False
+            if getattr(scene, "output_manager_show_overwrite_warnings", True):
+                is_node_overwrite = check_path_overwrite_status(full_p, getattr(node.format, 'file_format', ''))
+            if is_node_overwrite:
+                nrow.label(text="", icon='ERROR')
+
+            disp_p = full_p[:20] + "..." if len(full_p) > 20 else full_p
+            nrow.label(text=disp_p if disp_p else "(empty)")
 
 
 # --- Registration ---
@@ -1297,12 +1468,12 @@ classes = (
     OUTPUT_MANAGER_OT_confirm_overwrite,
     OUTPUT_MANAGER_OT_preset_apply,
     OUTPUT_MANAGER_OT_preset_remove,
+    OUTPUT_MANAGER_OT_decrement_version,
     OUTPUT_MANAGER_OT_increment_version,
     OUTPUT_MANAGER_OT_file_output_apply_preset,
-    OUTPUT_MANAGER_OT_file_output_apply_preset_all,
     OUTPUT_MANAGER_OT_file_output_store_preset,
     OUTPUT_MANAGER_PT_presets_popover,
-    OUTPUT_MANAGER_PT_file_output_popover,
+    NODE_PT_output_manager_node,
 )
 
 
@@ -1311,8 +1482,8 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.output_manager_sync_file_outputs = bpy.props.BoolProperty(
-        name="Sync File Output Nodes with +1",
-        description="When incrementing output path version with +1, also increment version numbers across all active Compositor File Output nodes",
+        name="Sync Comp (+1/-1)",
+        description="When stepping output path version with +1 or -1, also step version numbers across all active Compositor File Output nodes",
         default=True
     )
 
