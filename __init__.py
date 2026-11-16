@@ -11,8 +11,10 @@ bl_info = {
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 import bpy
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 
 # --- Storage Helpers ---
@@ -1829,6 +1831,209 @@ class OUTPUT_MANAGER_OT_sync_versions(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OUTPUT_MANAGER_OT_open_presets_dir(bpy.types.Operator):
+    """Open the directory containing presets.json in the OS file explorer"""
+    bl_idname = "output_manager.open_presets_dir"
+    bl_label = "Open Presets Folder"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        p = get_presets_filepath().parent
+        if not p.exists():
+            p.mkdir(parents=True, exist_ok=True)
+        try:
+            bpy.ops.wm.path_open(filepath=str(p))
+            return {'FINISHED'}
+        except Exception:
+            try:
+                import os
+                os.startfile(str(p))
+                return {'FINISHED'}
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to open folder: {e}")
+                return {'CANCELLED'}
+
+
+class OUTPUT_MANAGER_OT_export_presets(bpy.types.Operator, ExportHelper):
+    """Export all Output Manager presets and pattern templates to a JSON backup file"""
+    bl_idname = "output_manager.export_presets"
+    bl_label = "Export Presets Backup"
+    bl_options = {'REGISTER'}
+
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(
+        default="*.json",
+        options={'HIDDEN'},
+        maxlen=255,
+    )
+
+    def execute(self, context):
+        data = load_presets_from_disk()
+        export_payload = {
+            "schema_version": 1,
+            "addon": "output_manager",
+            "export_time": datetime.now().isoformat(),
+            "active_preset": data.get("active_preset", ""),
+            "active_socket_pattern": data.get("active_socket_pattern", ""),
+            "presets": data.get("presets", []),
+            "socket_patterns": data.get("socket_patterns", list(DEFAULT_SOCKET_PATTERNS)),
+        }
+
+        try:
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(export_payload, f, indent=2)
+            p_cnt = len(export_payload["presets"])
+            s_cnt = len(export_payload["socket_patterns"])
+            self.report({'INFO'}, f"Exported {p_cnt} preset(s) and {s_cnt} pattern(s) to '{os.path.basename(self.filepath)}'")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to export presets: {e}")
+            return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        date_str = datetime.now().strftime("%Y%m%d")
+        self.filepath = f"output_manager_backup_{date_str}.json"
+        return super().invoke(context, event)
+
+
+class OUTPUT_MANAGER_OT_import_presets(bpy.types.Operator, ImportHelper):
+    """Import Output Manager presets and pattern templates from a JSON backup file"""
+    bl_idname = "output_manager.import_presets"
+    bl_label = "Import Presets Backup"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(
+        default="*.json",
+        options={'HIDDEN'},
+        maxlen=255,
+    )
+
+    import_mode: bpy.props.EnumProperty(
+        name="Import Mode",
+        description="Choose how incoming presets should be merged with your current settings",
+        items=[
+            ('MERGE', "Merge & Update", "Add new presets and patterns; update matching names with backup values while keeping existing ones"),
+            ('REPLACE', "Full Restore (Replace All)", "Completely replace current presets and patterns with the backup file"),
+        ],
+        default='MERGE'
+    )
+
+    def execute(self, context):
+        if not os.path.exists(self.filepath):
+            self.report({'ERROR'}, f"File not found: {self.filepath}")
+            return {'CANCELLED'}
+
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                imported_data = json.load(f)
+        except Exception as e:
+            self.report({'ERROR'}, f"Invalid JSON file: {e}")
+            return {'CANCELLED'}
+
+        if not isinstance(imported_data, dict):
+            self.report({'ERROR'}, "Invalid backup file: root must be a JSON object")
+            return {'CANCELLED'}
+
+        incoming_presets = imported_data.get("presets", [])
+        incoming_patterns = imported_data.get("socket_patterns", [])
+
+        if not isinstance(incoming_presets, list) or not isinstance(incoming_patterns, list):
+            self.report({'ERROR'}, "Invalid backup file structure: 'presets' and 'socket_patterns' must be lists")
+            return {'CANCELLED'}
+
+        current_data = load_presets_from_disk()
+
+        if self.import_mode == 'REPLACE':
+            current_data["presets"] = incoming_presets
+            current_data["socket_patterns"] = incoming_patterns if incoming_patterns else list(DEFAULT_SOCKET_PATTERNS)
+            if imported_data.get("active_preset"):
+                current_data["active_preset"] = imported_data["active_preset"]
+            elif current_data["presets"]:
+                current_data["active_preset"] = current_data["presets"][0]["name"]
+            if imported_data.get("active_socket_pattern"):
+                current_data["active_socket_pattern"] = imported_data["active_socket_pattern"]
+            save_presets_to_disk(current_data)
+            self.report({'INFO'}, f"Restored {len(incoming_presets)} preset(s) and {len(incoming_patterns)} pattern(s)")
+            return {'FINISHED'}
+
+        # Mode == 'MERGE'
+        existing_presets = current_data.get("presets", [])
+        preset_map = {p["name"]: p for p in existing_presets if isinstance(p, dict) and "name" in p}
+        added_presets = 0
+        updated_presets = 0
+
+        for p in incoming_presets:
+            if not isinstance(p, dict) or "name" not in p:
+                continue
+            name = p["name"]
+            if name in preset_map:
+                preset_map[name] = p
+                updated_presets += 1
+            else:
+                preset_map[name] = p
+                added_presets += 1
+
+        current_data["presets"] = list(preset_map.values())
+
+        existing_patterns = current_data.get("socket_patterns", list(DEFAULT_SOCKET_PATTERNS))
+        pattern_map = {pat["name"]: pat for pat in existing_patterns if isinstance(pat, dict) and "name" in pat}
+        added_patterns = 0
+        updated_patterns = 0
+
+        for pat in incoming_patterns:
+            if not isinstance(pat, dict) or "name" not in pat:
+                continue
+            name = pat["name"]
+            if name in pattern_map:
+                pattern_map[name] = pat
+                updated_patterns += 1
+            else:
+                pattern_map[name] = pat
+                added_patterns += 1
+
+        current_data["socket_patterns"] = list(pattern_map.values())
+        save_presets_to_disk(current_data)
+
+        self.report({'INFO'}, f"Merged: {added_presets} added / {updated_presets} updated presets; {added_patterns} added / {updated_patterns} updated patterns")
+        return {'FINISHED'}
+
+
+class OUTPUT_MANAGER_preferences(bpy.types.AddonPreferences):
+    bl_idname = __package__ or "output_manager"
+
+    def draw(self, context):
+        layout = self.layout
+
+        data = load_presets_from_disk()
+        presets = data.get("presets", [])
+        patterns = data.get("socket_patterns", [])
+        preset_file = get_presets_filepath()
+
+        # Section: Preset Statistics & Storage Location
+        box = layout.box()
+        h_row = box.row(align=True)
+        h_row.label(text="Preset Storage & Statistics", icon='PRESET')
+        h_row.operator("output_manager.open_presets_dir", text="Open Folder", icon='FILE_FOLDER')
+
+        col = box.column(align=True)
+        col.label(text=f"Stored Presets: {len(presets)} scene preset(s)")
+        col.label(text=f"Stored Patterns: {len(patterns)} pass socket pattern template(s)")
+        col.label(text=f"File: {preset_file}", icon='DISK_DRIVE')
+
+        # Section: Backup & Restore (JSON Export / Import)
+        box_backup = layout.box()
+        b_hdr = box_backup.row(align=True)
+        b_hdr.label(text="Backup & Restore (JSON)", icon='FILE_BACKUP')
+
+        b_row = box_backup.row(align=True)
+        b_row.scale_y = 1.25
+        b_row.operator("output_manager.export_presets", text="Export Presets Backup...", icon='EXPORT')
+        b_row.operator("output_manager.import_presets", text="Import Presets Backup...", icon='IMPORT')
+
+        box_backup.label(text="Exports all presets, pass socket patterns, and active selections to a single portable JSON file.", icon='INFO')
+
+
 # --- UI Panels & Controls ---
 
 class NODE_PT_output_manager_node(bpy.types.Panel):
@@ -1986,38 +2191,46 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
         if not presets:
             box = col.box()
             box.label(text="No stored presets yet", icon='INFO')
-            return
+        else:
+            for p in presets:
+                is_active = (p["name"] == active_name)
+                box = col.box()
 
-        for p in presets:
-            is_active = (p["name"] == active_name)
-            box = col.box()
+                # Row 1: Active Indicator + Name + Format/Media Tag + Delete
+                r1 = box.row(align=True)
+                apply_icon = r1.operator(
+                    "output_manager.preset_apply",
+                    text="",
+                    icon='CHECKMARK' if is_active else 'BLANK1'
+                )
+                apply_icon.name = p["name"]
 
-            # Row 1: Active Indicator + Name + Format/Media Tag + Delete
-            r1 = box.row(align=True)
-            apply_icon = r1.operator(
-                "output_manager.preset_apply",
-                text="",
-                icon='CHECKMARK' if is_active else 'BLANK1'
-            )
-            apply_icon.name = p["name"]
+                r1.label(text=p["name"])
 
-            r1.label(text=p["name"])
+                fmt_tag = p.get("format_summary", "")
+                if fmt_tag:
+                    r1.label(text=fmt_tag)
 
-            fmt_tag = p.get("format_summary", "")
-            if fmt_tag:
-                r1.label(text=fmt_tag)
+                del_op = r1.operator("output_manager.preset_remove", text="", icon='X')
+                del_op.name = p["name"]
 
-            del_op = r1.operator("output_manager.preset_remove", text="", icon='X')
-            del_op.name = p["name"]
+                # Row 2: Filepath preview + single Apply button
+                r2 = box.row(align=True)
+                raw_path = p.get("filepath", "")
+                disp_path = raw_path[:24] + "..." if len(raw_path) > 24 else raw_path
+                r2.label(text=disp_path if disp_path else "(empty)")
 
-            # Row 2: Filepath preview + single Apply button
-            r2 = box.row(align=True)
-            raw_path = p.get("filepath", "")
-            disp_path = raw_path[:24] + "..." if len(raw_path) > 24 else raw_path
-            r2.label(text=disp_path if disp_path else "(empty)")
+                apply_btn = r2.operator("output_manager.preset_apply", text="Apply")
+                apply_btn.name = p["name"]
 
-            apply_btn = r2.operator("output_manager.preset_apply", text="Apply")
-            apply_btn.name = p["name"]
+        # Backup & Restore row at the bottom of the popover
+        col.separator()
+        b_box = col.box()
+        b_hdr = b_box.row(align=True)
+        b_hdr.label(text="Backup & Restore", icon='FILE_BACKUP')
+        b_row = b_box.row(align=True)
+        b_row.operator("output_manager.export_presets", text="Export JSON...", icon='EXPORT')
+        b_row.operator("output_manager.import_presets", text="Import JSON...", icon='IMPORT')
 
 
 def draw_output_manager_header(self, context):
@@ -2113,6 +2326,10 @@ classes = (
     OUTPUT_MANAGER_OT_capture_pattern_from_node,
     OUTPUT_MANAGER_OT_save_socket_pattern_preset,
     OUTPUT_MANAGER_OT_delete_socket_pattern_preset,
+    OUTPUT_MANAGER_OT_open_presets_dir,
+    OUTPUT_MANAGER_OT_export_presets,
+    OUTPUT_MANAGER_OT_import_presets,
+    OUTPUT_MANAGER_preferences,
     OUTPUT_MANAGER_PT_presets_popover,
     NODE_PT_output_manager_node,
 )
