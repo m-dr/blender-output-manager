@@ -546,6 +546,67 @@ def decrement_path_version(filepath: str) -> tuple[str, bool]:
     return new_path, True
 
 
+def set_path_version(filepath: str, target_val: int) -> tuple[str, bool]:
+    """Find version number occurrences across folder and filename, updating all to target_val."""
+    if not filepath or not filepath.strip() or target_val < 1:
+        return filepath, False
+
+    pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])?(\d+)(?=[^a-zA-Z0-9]|$)')
+    matches = list(pattern.finditer(filepath))
+    if not matches:
+        return filepath, False
+
+    v_matches = [m for m in matches if m.group(2)]
+    if v_matches:
+        target_digits_candidates = {m.group(3) for m in v_matches}
+        to_replace = []
+        for m in matches:
+            if m.group(2):
+                to_replace.append(m)
+            elif m.group(3) in target_digits_candidates:
+                to_replace.append(m)
+
+        changed = False
+        new_path = filepath
+        for m in reversed(to_replace):
+            orig_digits = m.group(3)
+            pad = len(orig_digits)
+            new_digits = f"{target_val:0{pad}d}"
+            if orig_digits != new_digits:
+                changed = True
+            start_idx = m.start(3)
+            end_idx = m.end(3)
+            new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+        return new_path, changed
+
+    last_slash = max(filepath.rfind('/'), filepath.rfind('\\'))
+    file_part = filepath[last_slash + 1:] if last_slash != -1 else filepath
+
+    file_base = file_part
+    file_base = re.sub(r'#+$', '', file_base)
+    file_base = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', file_base)
+
+    file_matches = list(pattern.finditer(file_base))
+    if file_matches:
+        target_digits = file_matches[-1].group(3)
+    else:
+        target_digits = matches[-1].group(3)
+
+    pad = len(target_digits)
+    new_digits = f"{target_val:0{pad}d}"
+    if target_digits == new_digits:
+        return filepath, False
+
+    to_replace = [m for m in matches if m.group(3) == target_digits]
+    new_path = filepath
+    for m in reversed(to_replace):
+        start_idx = m.start(3)
+        end_idx = m.end(3)
+        new_path = new_path[:start_idx] + new_digits + new_path[end_idx:]
+
+    return new_path, True
+
+
 def capture_current_output_settings(scene) -> dict:
     """Capture current filepath and format settings from scene render settings."""
     render = scene.render
@@ -678,6 +739,130 @@ def get_node_slots_collection(node):
         if col is not None:
             return col
     return []
+
+
+def get_path_version_number(filepath: str) -> int | None:
+    """Return explicit version integer if filepath contains a version token, else None."""
+    if not filepath or not filepath.strip():
+        return None
+
+    pattern = re.compile(r'(^|[^a-zA-Z0-9])([vV])(\d+)(?=[^a-zA-Z0-9]|$)')
+    v_matches = list(pattern.finditer(filepath))
+    if v_matches:
+        return int(v_matches[-1].group(3))
+
+    clean = re.sub(r'#+$', '', filepath.strip()).rstrip('._- ')
+    last_slash = max(clean.rfind('/'), clean.rfind('\\'))
+    filename = clean[last_slash + 1:] if last_slash != -1 else clean
+    filename_no_ext = re.sub(r'\.[a-zA-Z0-9]{2,4}$', '', filename)
+
+    num_pattern = re.compile(r'(^|[^a-zA-Z0-9])(\d+)(?=[^a-zA-Z0-9]|$)')
+    num_matches = list(num_pattern.finditer(filename_no_ext))
+    if num_matches:
+        return int(num_matches[-1].group(2))
+
+    return None
+
+
+def get_node_versions(node) -> list[int]:
+    """Return all explicit version numbers found across node directory, filename, and item slots."""
+    vers = []
+    dir_str = getattr(node, 'directory', '') or getattr(node, 'base_path', '')
+    fn_str = getattr(node, 'file_name', '')
+
+    v_dir = get_path_version_number(dir_str)
+    if v_dir is not None:
+        vers.append(v_dir)
+
+    v_fn = get_path_version_number(fn_str)
+    if v_fn is not None:
+        vers.append(v_fn)
+
+    for item in get_node_slots_collection(node):
+        raw_name = getattr(item, 'name', '')
+        if raw_name:
+            v_item = get_path_version_number(raw_name)
+            if v_item is not None:
+                vers.append(v_item)
+
+    return vers
+
+
+def sync_node_to_version(node, target_ver: int) -> int:
+    """Set version on node directory, filename, and all slot items to target_ver."""
+    count = 0
+    if hasattr(node, "directory") and node.directory:
+        new_dir, ok = set_path_version(node.directory, target_ver)
+        if ok:
+            node.directory = new_dir
+            count += 1
+    elif hasattr(node, "base_path") and node.base_path:
+        new_bp, ok = set_path_version(node.base_path, target_ver)
+        if ok:
+            node.base_path = new_bp
+            count += 1
+
+    if hasattr(node, "file_name") and node.file_name:
+        new_fn, ok = set_path_version(node.file_name, target_ver)
+        if ok:
+            node.file_name = new_fn
+            count += 1
+
+    for item in get_node_slots_collection(node):
+        raw_name = getattr(item, 'name', '')
+        if raw_name:
+            new_item, ok = set_path_version(raw_name, target_ver)
+            if ok:
+                item.name = new_item
+                count += 1
+
+    return count
+
+
+def get_version_pool_status(scene) -> dict:
+    """Analyze all active render outputs and compositor file nodes to find highest version and sync status."""
+    all_versions = []
+
+    # 1. Main output
+    main_path = getattr(scene.render, 'filepath', '')
+    main_ver = get_path_version_number(main_path)
+    if main_ver is not None:
+        all_versions.append(main_ver)
+
+    # 2. File output nodes
+    fo_nodes = get_file_output_nodes(scene)
+    node_data = {}
+    for node in fo_nodes:
+        if node.mute:
+            continue
+        n_vers = get_node_versions(node)
+        all_versions.extend(n_vers)
+        node_data[node.name] = {
+            'node': node,
+            'versions': n_vers,
+            'primary_ver': max(n_vers) if n_vers else None
+        }
+
+    max_version = max(all_versions) if all_versions else (main_ver or 1)
+
+    scene_out_of_sync = (main_ver is not None and main_ver < max_version)
+    out_of_sync_nodes = []
+    for name, data in node_data.items():
+        if data['primary_ver'] is not None and data['primary_ver'] < max_version:
+            out_of_sync_nodes.append(name)
+        elif any(v < max_version for v in data['versions']):
+            out_of_sync_nodes.append(name)
+
+    is_all_synced = (not scene_out_of_sync) and (len(out_of_sync_nodes) == 0)
+
+    return {
+        'max_version': max_version,
+        'is_all_synced': is_all_synced,
+        'main_ver': main_ver,
+        'scene_out_of_sync': scene_out_of_sync,
+        'out_of_sync_nodes': out_of_sync_nodes,
+        'node_data': node_data
+    }
 
 
 def capture_file_output_node_settings(node) -> dict:
@@ -1058,6 +1243,14 @@ class OUTPUT_MANAGER_OT_decrement_version(bpy.types.Operator):
                     target_node.file_name = new_fn
                     changed = True
 
+            for item in get_node_slots_collection(target_node):
+                raw_name = getattr(item, 'name', '')
+                if raw_name:
+                    new_item, ok_item = decrement_path_version(raw_name)
+                    if ok_item:
+                        item.name = new_item
+                        changed = True
+
             if not changed:
                 self.report({'WARNING'}, f"Cannot decrement: Node '{self.node_name}' has no version number or is already at v001")
                 return {'CANCELLED'}
@@ -1094,6 +1287,14 @@ class OUTPUT_MANAGER_OT_decrement_version(bpy.types.Operator):
                     if ok_fn:
                         node.file_name = new_fn
                         node_changed = True
+
+                for item in get_node_slots_collection(node):
+                    raw_name = getattr(item, 'name', '')
+                    if raw_name:
+                        new_item, ok_item = decrement_path_version(raw_name)
+                        if ok_item:
+                            item.name = new_item
+                            node_changed = True
 
                 if node_changed:
                     fo_updated += 1
@@ -1149,6 +1350,14 @@ class OUTPUT_MANAGER_OT_increment_version(bpy.types.Operator):
                     target_node.file_name = new_fn
                     changed = True
 
+            for item in get_node_slots_collection(target_node):
+                raw_name = getattr(item, 'name', '')
+                if raw_name:
+                    new_item, ok_item = increment_path_version(raw_name)
+                    if ok_item:
+                        item.name = new_item
+                        changed = True
+
             if not changed:
                 self.report({'WARNING'}, f"No version number found in node '{self.node_name}'")
                 return {'CANCELLED'}
@@ -1189,6 +1398,14 @@ class OUTPUT_MANAGER_OT_increment_version(bpy.types.Operator):
                     if ok_fn:
                         node.file_name = new_fn
                         node_changed = True
+
+                for item in get_node_slots_collection(node):
+                    raw_name = getattr(item, 'name', '')
+                    if raw_name:
+                        new_item, ok_item = increment_path_version(raw_name)
+                        if ok_item:
+                            item.name = new_item
+                            node_changed = True
 
                 if node_changed:
                     fo_updated += 1
@@ -1551,6 +1768,67 @@ class OUTPUT_MANAGER_OT_clean_multilayer_slots(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OUTPUT_MANAGER_OT_sync_versions(bpy.types.Operator):
+    """Synchronize output versions across scene output and Compositor File Output nodes favoring the highest version"""
+    bl_idname = "output_manager.sync_versions"
+    bl_label = "Sync Output Versions"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target: bpy.props.EnumProperty(
+        name="Target",
+        items=[
+            ('ALL', "All Outputs", "Synchronize scene output and all active File Output nodes to highest pool version"),
+            ('NODE', "Specific Node", "Synchronize this File Output node to highest pool version"),
+        ],
+        default='ALL'
+    )
+    node_name: bpy.props.StringProperty(name="Node Name", default="")
+
+    def execute(self, context):
+        scene = context.scene
+        pool = get_version_pool_status(scene)
+        target_ver = pool['max_version']
+        target_v_str = f"v{target_ver:03d}"
+
+        if self.target == 'NODE':
+            target_name = self.node_name or (context.active_node.name if getattr(context, 'active_node', None) else "")
+            nodes = get_file_output_nodes(scene)
+            node = next((n for n in nodes if n.name == target_name), None)
+            if not node and getattr(context, 'active_node', None) and getattr(context.active_node, 'type', None) == 'OUTPUT_FILE':
+                node = context.active_node
+
+            if not node:
+                self.report({'WARNING'}, f"Node '{target_name}' not found")
+                return {'CANCELLED'}
+
+            count = sync_node_to_version(node, target_ver)
+            self.report({'INFO'}, f"Synced node '{node.name}' to {target_v_str} ({count} path(s)/slot(s) updated)")
+            return {'FINISHED'}
+
+        # Target ALL
+        updated_count = 0
+        new_scene_path, ok_scene = set_path_version(scene.render.filepath, target_ver)
+        if ok_scene:
+            scene.render.filepath = new_scene_path
+            updated_count += 1
+
+        fo_updated = 0
+        for node in get_file_output_nodes(scene):
+            if node.mute:
+                continue
+            cnt = sync_node_to_version(node, target_ver)
+            if cnt > 0:
+                fo_updated += 1
+                updated_count += cnt
+
+        if updated_count == 0:
+            self.report({'INFO'}, f"All outputs are already in sync at {target_v_str}")
+            return {'FINISHED'}
+
+        self.report({'INFO'}, f"Synced all outputs to {target_v_str} (Main + {fo_updated} node(s))")
+        return {'FINISHED'}
+
+
 # --- UI Panels & Controls ---
 
 class NODE_PT_output_manager_node(bpy.types.Panel):
@@ -1589,6 +1867,25 @@ class NODE_PT_output_manager_node(bpy.types.Panel):
 
         inc_op = row.operator("output_manager.increment_version", text="+1")
         inc_op.node_name = node.name
+
+        # Version Sync Notice if out of sync with pool
+        pool = get_version_pool_status(scene)
+        is_node_out_of_sync = node.name in pool['out_of_sync_nodes']
+        if is_node_out_of_sync:
+            alert_box = layout.box()
+            a_row = alert_box.row(align=True)
+            a_row.alert = True
+            node_v = pool['node_data'].get(node.name, {}).get('primary_ver')
+            node_v_str = f"v{node_v:03d}" if node_v else "unversioned"
+            a_row.label(text=f"Version Mismatch: Node is {node_v_str} (Pool max: v{pool['max_version']:03d})", icon='ERROR')
+
+            btn_row = alert_box.row(align=True)
+            sync_n = btn_row.operator("output_manager.sync_versions", text=f"⟳ Sync Node to v{pool['max_version']:03d}", icon='FILE_REFRESH')
+            sync_n.target = 'NODE'
+            sync_n.node_name = node.name
+
+            sync_a = btn_row.operator("output_manager.sync_versions", text="Sync All Outputs", icon='LINKED')
+            sync_a.target = 'ALL'
 
         # Box: Output Architecture Breakdown
         box = layout.box()
@@ -1761,6 +2058,17 @@ def draw_output_manager_header(self, context):
     comp_row.prop(scene.render, "use_compositing", text="Compositor", icon='NODE_COMPOSITING')
     comp_row.prop(scene, "output_manager_sync_file_outputs", text="Sync Comp (+1/-1)", icon='LINKED')
 
+    pool = get_version_pool_status(scene)
+    if not pool['is_all_synced']:
+        sync_row = layout.row(align=True)
+        sync_row.alert = True
+        sync_all = sync_row.operator(
+            "output_manager.sync_versions",
+            text=f"⚠️ Versions Out of Sync — Align All to v{pool['max_version']:03d}",
+            icon='FILE_REFRESH'
+        )
+        sync_all.target = 'ALL'
+
     # Row 3: Detected Compositor File Output Nodes directly inline
     fo_nodes = get_file_output_nodes(scene)
     if fo_nodes:
@@ -1775,6 +2083,13 @@ def draw_output_manager_header(self, context):
             nrow.prop(node, "mute", text="", icon=mute_icon, invert_checkbox=True)
             nrow.label(text=node.name, icon='OUTPUT')
             nrow.label(text=format_summary_from_rna(node.format))
+
+            if node.name in pool['out_of_sync_nodes']:
+                curr_v = pool['node_data'].get(node.name, {}).get('primary_ver')
+                curr_str = f"v{curr_v:03d}" if curr_v else "v???"
+                sync_btn = nrow.operator("output_manager.sync_versions", text=f"⟳ {curr_str} → v{pool['max_version']:03d}", icon='FILE_REFRESH')
+                sync_btn.target = 'NODE'
+                sync_btn.node_name = node.name
 
             _, _, full_p = get_node_path_strings(node)
             disp_p = full_p[:20] + "..." if len(full_p) > 20 else full_p
@@ -1794,6 +2109,7 @@ classes = (
     OUTPUT_MANAGER_OT_file_output_store_preset,
     OUTPUT_MANAGER_OT_format_pass_sockets,
     OUTPUT_MANAGER_OT_clean_multilayer_slots,
+    OUTPUT_MANAGER_OT_sync_versions,
     OUTPUT_MANAGER_OT_capture_pattern_from_node,
     OUTPUT_MANAGER_OT_save_socket_pattern_preset,
     OUTPUT_MANAGER_OT_delete_socket_pattern_preset,
