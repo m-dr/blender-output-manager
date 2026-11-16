@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Output Manager (DEV)",
     "author": "MD",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (5, 2, 0),
     "location": "Properties > Output > Output Panel",
     "description": "Global presets for render output filepath, file formats, encoding settings, and Compositor File Output nodes",

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "output_manager"
-version = "0.1.0"
+version = "0.1.1"
 name = "Output Manager (DEV)"
 tagline = "Global presets for render output filepath, file formats, and encoding settings"
 maintainer = "MD <m-dr>"
