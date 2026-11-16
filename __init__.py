@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Output Manager (DEV)",
     "author": "MD",
-    "version": (0, 1, 1),
+    "version": (0, 1, 2),
     "blender": (5, 2, 0),
     "location": "Properties > Output > Output Panel",
     "description": "Global presets for render output filepath, file formats, encoding settings, and Compositor File Output nodes",
@@ -46,7 +46,17 @@ def load_presets_from_disk() -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if "socket_patterns" not in data or not data["socket_patterns"]:
+            # Validate untrusted/user-editable JSON so a malformed file can never
+            # raise later inside a UI draw callback (which would hide a whole panel).
+            if not isinstance(data, dict):
+                raise ValueError("presets JSON root is not an object")
+            if not isinstance(data.get("presets"), list):
+                data["presets"] = []
+            data["presets"] = [p for p in data["presets"] if isinstance(p, dict) and "name" in p]
+            if not isinstance(data.get("socket_patterns"), list) or not data["socket_patterns"]:
+                data["socket_patterns"] = list(DEFAULT_SOCKET_PATTERNS)
+            data["socket_patterns"] = [p for p in data["socket_patterns"] if isinstance(p, dict) and "name" in p]
+            if not data["socket_patterns"]:
                 data["socket_patterns"] = list(DEFAULT_SOCKET_PATTERNS)
             if "active_socket_pattern" not in data:
                 data["active_socket_pattern"] = data["socket_patterns"][0]["name"]
@@ -704,14 +714,30 @@ def is_output_settings_dirty(scene, preset_dict: dict) -> bool:
 
 # --- Compositor File Output Node Helpers ---
 
+def get_compositor_trees(scene) -> list:
+    """Return the scene's compositor node tree(s) across Blender versions.
+
+    Blender 5.3 replaced the single scene compositor tree with an effects stack
+    (``Scene.compositor_effects``). ``Scene.compositing_node_group`` is deprecated
+    there and only exposes the active effect, so it must not be used on 5.3+.
+    """
+    effects = getattr(scene, 'compositor_effects', None)
+    if effects is not None:
+        return [effect.node_group for effect in effects
+                if getattr(effect, 'node_group', None) is not None]
+    # Blender 5.0-5.2 (compositing_node_group) and older (node_tree).
+    tree = getattr(scene, 'compositing_node_group', None) or getattr(scene, 'node_tree', None)
+    return [tree] if tree is not None and hasattr(tree, 'nodes') else []
+
+
 def get_file_output_nodes(scene) -> list:
     """Return all Compositor File Output nodes in the active scene."""
     if not scene:
         return []
-    tree = getattr(scene, 'compositing_node_group', None) or getattr(scene, 'node_tree', None)
-    if not tree or not hasattr(tree, 'nodes'):
-        return []
-    return [n for n in tree.nodes if getattr(n, 'type', None) == 'OUTPUT_FILE']
+    nodes = []
+    for tree in get_compositor_trees(scene):
+        nodes.extend(n for n in tree.nodes if getattr(n, 'type', None) == 'OUTPUT_FILE')
+    return nodes
 
 
 def get_node_path_strings(node) -> tuple[str, str, str]:
@@ -2233,7 +2259,7 @@ class OUTPUT_MANAGER_PT_presets_popover(bpy.types.Panel):
         b_row.operator("output_manager.import_presets", text="Import JSON...", icon='IMPORT')
 
 
-def draw_output_manager_header(self, context):
+def _draw_output_manager_header(self, context):
     """Draw Output Manager preset popover, compositor toggles, and inline File Output nodes."""
     layout = self.layout
     scene = context.scene
@@ -2307,6 +2333,15 @@ def draw_output_manager_header(self, context):
             _, _, full_p = get_node_path_strings(node)
             disp_p = full_p[:20] + "..." if len(full_p) > 20 else full_p
             nrow.label(text=disp_p if disp_p else "(empty)")
+
+
+def draw_output_manager_header(self, context):
+    """Hook for RENDER_PT_output: never let an add-on error hide Blender's Output panel."""
+    try:
+        _draw_output_manager_header(self, context)
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
 
 # --- Registration ---
